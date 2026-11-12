@@ -1,0 +1,10 @@
+[server]
+maxUploadSize = 2048
+port = 8600
+headless = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
