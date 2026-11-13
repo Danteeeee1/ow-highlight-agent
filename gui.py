@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import queue
 import sys
 import threading
@@ -83,6 +85,7 @@ from owagent.config import apply_overrides, load_config, pixel_roi  # noqa: E402
 from owagent.selftest import compare, generate     # noqa: E402
 from owagent.util import ToolError, fmt_time, probe  # noqa: E402
 from owagent.model import fetch_weights, weights_dir  # noqa: E402
+from owagent.reviewer import _resolve_key, ping_api  # noqa: E402
 
 
 def _env_status() -> dict:
@@ -107,6 +110,7 @@ def _make_args(*, video: str = "", dry_run: bool = False, **kw) -> SimpleNamespa
         cmd="process", video=video, config=None, roi=None,
         threshold=None, fps=None, top_k=None, pre=None, post=None, gap=None,
         no_audio=False, recognizer=None, game=None, confidence=None,
+        review=False, no_review=False,
         vertical=False, burn=False, bgm=None, llm=False,
         dry_run=dry_run, workdir=None, out=None,
     )
@@ -123,8 +127,13 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title(f"OW 高光剪辑 Agent v{__version__}")
-        root.geometry("1060x720")
-        root.minsize(900, 620)
+        # 布局实测需求约 1160x800；默认给足空间，小屏（如 1366x768 笔记本）自动收缩
+        w, h = 1200, 820
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        if sw < w + 40 or sh < h + 80:
+            w, h = min(w, sw - 80), min(h, sh - 140)
+        root.geometry(f"{w}x{h}")
+        root.minsize(980, 680)
         try:
             root.iconbitmap(str(ROOT / "ow.ico")) if (ROOT / "ow.ico").is_file() else None
         except Exception:
@@ -133,11 +142,18 @@ class App:
         self.env = _env_status()
         self.running = False
         self.last_result: dict | None = None
+        self._pending_after_check = None  # API 预检完成后的回调
+        try:  # 启动时解析一次已有 Key（env / config.local.json），供输入框预填
+            self._resolved_key = _resolve_key(
+                load_config(DEFAULT_CFG if Path(DEFAULT_CFG).is_file() else None))
+        except Exception:
+            self._resolved_key = ""
 
         self._build_style()
         self._build_layout()
         self._refresh_env_labels()
         self._refresh_backend_state()
+        self._refresh_review_state()
         self.root.after(100, self._drain_logq)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         gui_log("界面就绪。请选择一段录像，然后点「开始处理」。", "start")
@@ -217,6 +233,32 @@ class App:
         self.lbl_weights = ttk.Label(bf, text="", foreground="#0a7")
         self.lbl_weights.pack(anchor="w")
 
+        # ---- 2b. 语义复核（VLM）----
+        rf = ttk.LabelFrame(left, text=" 2b · 语义复核（VLM 大模型） ", padding=8)
+        rf.pack(fill="x", pady=(8, 0))
+        self.var_review = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rf, text="启用 DeepSeek 视觉复核（判断事件类型/精彩度并写解说）",
+                        variable=self.var_review).pack(anchor="w")
+        keyrow = ttk.Frame(rf)
+        keyrow.pack(fill="x", pady=(6, 0))
+        ttk.Label(keyrow, text="API Key:").pack(side="left")
+        self.var_apikey = tk.StringVar(value=self._resolved_key)
+        self.ent_apikey = ttk.Entry(keyrow, textvariable=self.var_apikey,
+                                    show="•", width=26)
+        self.ent_apikey.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        self.ent_apikey.bind("<Return>", lambda e: self._save_apikey())
+        self.ent_apikey.bind("<FocusOut>", lambda e: self._save_apikey())
+        self.var_showkey = tk.BooleanVar(value=False)
+        ttk.Checkbutton(keyrow, text="显示", variable=self.var_showkey,
+                        command=self._toggle_key_visibility).pack(side="left")
+        ttk.Button(keyrow, text="测试连接", command=self._test_api).pack(
+            side="left", padx=(4, 0))
+        self.lbl_review = ttk.Label(rf, text="", justify="left", foreground="#0a7")
+        self.lbl_review.pack(anchor="w", pady=(4, 0))
+        ttk.Label(rf, text="Key 保存在本机 config.local.json（不会进 git）；"
+                          "启用复核后，开始处理前会自动检测可用性",
+                  foreground="#888", wraplength=360, justify="left").pack(anchor="w")
+
         # ---- 3. 检测与出片参数 ----
         pf = ttk.LabelFrame(left, text=" 3 · 参数 ", padding=8)
         pf.pack(fill="x", pady=(8, 0))
@@ -240,6 +282,8 @@ class App:
         numrow(2, "事件前留白(秒)", self.var_pre, 0, 30, 0.5)
         self.var_post = tk.StringVar(value="3")
         numrow(3, "事件后留白(秒)", self.var_post, 0, 30, 0.5)
+        self.var_maxseg = tk.StringVar(value="8")
+        numrow(4, "VLM 复核段数", self.var_maxseg, 1, 20, 1, "每段一次调用")
 
         opts = ttk.Frame(pf)
         opts.pack(fill="x", pady=(6, 0))
@@ -279,12 +323,12 @@ class App:
 
         ttk.Label(right, text="入选高光片段", style="Section.TLabel").grid(
             row=2, column=0, sticky="w")
-        cols = ("rank", "start", "end", "score", "reason")
+        cols = ("rank", "start", "end", "score", "event", "reason")
         self.tree = ttk.Treeview(right, columns=cols, show="headings", height=7)
         for cid, text, w, anchor in (
                 ("rank", "#", 36, "center"), ("start", "开始", 90, "center"),
                 ("end", "结束", 90, "center"), ("score", "得分", 70, "center"),
-                ("reason", "判定依据", 380, "w")):
+                ("event", "事件/VLM", 110, "center"), ("reason", "判定依据", 340, "w")):
             self.tree.heading(cid, text=text)
             self.tree.column(cid, width=w, anchor=anchor, stretch=(cid == "reason"))
         self.tree.grid(row=3, column=0, sticky="nsew")
@@ -319,10 +363,16 @@ class App:
             top_k=int(self.var_topk.get()),
             pre=float(self.var_pre.get()),
             post=float(self.var_post.get()),
+            review=self.var_review.get(),
             vertical=self.var_vertical.get(),
             burn=self.var_burn.get(),
             **kw)
-        return apply_overrides(cfg, args), args
+        cfg = apply_overrides(cfg, args)
+        try:  # 复核段数非 CLI 参数，直接落到配置
+            cfg["review"]["max_segments"] = max(1, int(self.var_maxseg.get()))
+        except (ValueError, KeyError):
+            pass
+        return cfg, args
 
     def _game_key(self) -> str:
         return [g for g, n in GAMES.items() if n == self.var_game.get()] or ["overwatch"]
@@ -469,6 +519,13 @@ class App:
         except (ValueError, KeyError) as exc:
             messagebox.showerror("参数错误", str(exc))
             return
+        self._save_apikey()  # 先把输入框里的 Key 落盘/生效，再做检测
+        if cfg["review"].get("enabled"):
+            self._precheck_api_then(cfg, lambda: self._start_process(video, args, cfg))
+            return
+        self._start_process(video, args, cfg)
+
+    def _start_process(self, video: str, args, cfg: dict):
         self._set_running(True, "处理中…（关闭窗口不会安全中止，请耐心等待）")
         self.tree.delete(*self.tree.get_children())
         self.btn_open.config(state="disabled")
@@ -489,6 +546,13 @@ class App:
         except ValueError as exc:
             messagebox.showerror("参数错误", str(exc))
             return
+        self._save_apikey()
+        if cfg["review"].get("enabled"):
+            self._precheck_api_then(cfg, lambda: self._start_demo(cfg))
+            return
+        self._start_demo(cfg)
+
+    def _start_demo(self, cfg: dict):
         self._set_running(True, "演示运行中…")
         self.tree.delete(*self.tree.get_children())
         gui_log("步骤 1/2：生成合成测试录像…", "demo")
@@ -511,11 +575,17 @@ class App:
         self.last_result = res
         tl = res["timeline"]
         for seg in tl.get("selected", []):
+            rv = seg.get("review") or {}
+            event = ""
+            if rv.get("event_label"):
+                event = (rv["event_label"]
+                         + (f"×{rv['kill_count']}" if rv.get("kill_count") else "")
+                         + f" {rv.get('excitement', '-')}/10")
             self.tree.insert("", "end", values=(
                 seg.get("rank", ""), fmt_time(seg["start"]), fmt_time(seg["end"]),
-                f"{seg['score']:.3f}", seg.get("reason", "")))
+                f"{seg['score']:.3f}", event, seg.get("reason", "")))
         if not tl.get("selected"):
-            self.tree.insert("", "end", values=("", "-", "-", "-",
+            self.tree.insert("", "end", values=("", "-", "-", "-", "",
                             "没有片段入选：试着调低判定阈值，或检查 ROI 是否覆盖击杀播报区"))
         self.btn_open.config(state="normal")
         out = (res.get("render") or {}).get("output")
@@ -558,6 +628,99 @@ class App:
                                 (self.env["ffmpeg"], self.env["ffprobe"], self.env["numpy"]))
                                 else "#a00"))
 
+    # ------------------------------------------------ API Key 与预检
+    def _toggle_key_visibility(self):
+        self.ent_apikey.config(show="" if self.var_showkey.get() else "•")
+
+    def _effective_key(self) -> str:
+        """输入框内容优先，其次环境变量 / config.local.json 里已配置的 Key。"""
+        return self.var_apikey.get().strip() or self._resolved_key
+
+    def _save_apikey(self):
+        """把输入框中的 Key 持久化到 config.local.json 并设会话环境变量（立即生效）。"""
+        key = self.var_apikey.get().strip()
+        if not key:
+            return
+        try:
+            f = ROOT / "config.local.json"
+            data: dict = {}
+            if f.is_file():
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            if data.get("review_api_key") != key:
+                data["review_api_key"] = key
+                f.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                             encoding="utf-8")
+                gui_log("API Key 已保存到 config.local.json", "review")
+        except OSError as exc:
+            gui_log(f"API Key 保存失败: {exc}", "warn")
+        # 会话内立即生效（_resolve_key 环境变量优先级最高）
+        os.environ["OWAGENT_REVIEW_KEY"] = key
+        self._resolved_key = key
+        self._refresh_review_state()
+
+    def _test_api(self):
+        """手动「测试连接」：后台 ping，结果写回状态行与日志。"""
+        self._save_apikey()
+        try:
+            cfg, _ = self._cfg_with_overrides(video="")
+        except (ValueError, KeyError):
+            cfg = {}
+        key = self._effective_key()
+        if not key:
+            self.lbl_review.config(text="✗ 请先输入 API Key（sk-…）", foreground="#b60")
+            return
+        self.lbl_review.config(text="正在测试 API 连接…", foreground="#666")
+
+        def fn():
+            ok, msg = ping_api(cfg, key)
+            _LOGQ.put(("sig", ("apitest", (ok, msg))))
+        threading.Thread(target=fn, daemon=True).start()
+
+    def _precheck_api_then(self, cfg: dict, start):
+        """启用语义复核时：先异步检测 API，通过（或用户选择跳过复核）后再 start。"""
+        key = self._effective_key()
+        if not key:
+            self._after_apicheck(False, "未配置 API Key", cfg, start)
+            return
+        self._set_running(True, "检测 API 连通性…")
+
+        def fn():
+            ok, msg = ping_api(cfg, key)
+            _LOGQ.put(("sig", ("apicheck", (ok, msg, id(cfg)))))
+        threading.Thread(target=fn, daemon=True).start()
+        self._pending_after_check = (cfg, start)
+
+    def _after_apicheck(self, ok: bool, msg: str, cfg: dict, start):
+        gui_log(f"[review] 启动前 API 检测: {msg}", "review" if ok else "warn")
+        if ok:
+            start()
+            return
+        if messagebox.askyesno(
+                "API 不可用",
+                f"语义复核 API 检测失败：\n\n{msg}\n\n"
+                "仍要继续处理吗？（将自动跳过语义复核，其余功能不受影响）"):
+            cfg["review"]["enabled"] = False
+            start()
+        else:
+            self._set_running(False, "空闲")
+
+    def _refresh_review_state(self):
+        """复核 Key 自检：输入框 > 环境变量 > config.local.json。"""
+        key = self._effective_key()
+        if key:
+            self.lbl_review.config(
+                text=f"✓ API Key 已配置（{key[:6]}…{key[-4:]}）· deepseek-flash",
+                foreground="#0a7")
+        else:
+            self.lbl_review.config(
+                text="✗ 未配置 API Key：在上方输入 DeepSeek Key（sk-…）",
+                foreground="#b60")
+
     def _refresh_backend_state(self):
         crispy = self.var_backend.get() == "crispy"
         state = "readonly" if crispy else "disabled"
@@ -589,6 +752,22 @@ class App:
                     elif kind == "env":
                         self._refresh_env_labels()
                         self._refresh_backend_state()
+                    elif kind == "apitest":
+                        ok, msg = data
+                        self.lbl_review.config(
+                            text=("✓ " if ok else "✗ ") + msg,
+                            foreground=("#0a7" if ok else "#b60"))
+                        gui_log(f"API 连接测试: {msg}", "review" if ok else "warn")
+                    elif kind == "apicheck":
+                        ok, msg, cfg_id = data
+                        pending = self._pending_after_check
+                        self._pending_after_check = None
+                        if pending is None:
+                            continue
+                        cfg, start = pending
+                        if id(cfg) != cfg_id:  # 过期的检测结果（用户已发起新任务）
+                            continue
+                        self._after_apicheck(ok, msg, cfg, start)
                     continue
                 text = payload
                 self.txt_log.config(state="normal")

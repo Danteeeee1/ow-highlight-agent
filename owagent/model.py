@@ -34,7 +34,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from .util import ToolError, ffmpeg_bin, log, read_exact
+from .util import NO_WINDOW, ToolError, ffmpeg_bin, log, read_exact
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -221,7 +221,8 @@ def detect_model(video: str | Path, cfg: dict, meta: dict) -> dict:
     idx = 0
 
     with tempfile.TemporaryFile(mode="w+b") as errfile:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile,
+                                creationflags=NO_WINDOW)
         assert proc.stdout is not None
         try:
             while True:

@@ -19,6 +19,26 @@ DEFAULT_CONFIG = {
         "fps": 8,
         "stretch": False
     },
+    "review": {
+        "_comment": "L2 语义复核：VLM 看入选片段关键帧，判定事件类型/精彩度并写解说（DeepSeek 云端）",
+        "enabled": False,
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "OWAGENT_REVIEW_KEY",
+        "api_key_file": "config.local.json",
+        "frames_per_segment": 4,
+        "max_segments": 8,
+        "frame_width": 768,
+        "effort": "low",
+        "max_tokens": 3000,
+        "timeout_sec": 180,
+        "concurrency": 2,
+        "drop_non_highlight": True,
+        "w_signal": 0.35,
+        "w_vlm": 0.45,
+        "w_event": 0.20
+    },
     "detect": {
         "diff_gain": 60.0,
         "rise_gain": 0.25,
@@ -97,6 +117,16 @@ def validate(cfg: dict, meta: dict | None = None) -> None:
         raise ValueError("recognizer.confidence 建议在 0.4~0.8 之间")
     if float(rec["fps"]) <= 0:
         raise ValueError("recognizer.fps 必须为正数")
+    rv = cfg.get("review", {})
+    if rv.get("enabled"):
+        if rv.get("provider") != "deepseek":
+            raise ValueError(f"review.provider 目前仅支持 deepseek，当前为 {rv.get('provider')}")
+        if not str(rv.get("model", "")).strip():
+            raise ValueError("review.model 不能为空")
+        if not 0.05 <= float(rv.get("w_signal", 0.35)) <= 1:
+            raise ValueError("review.w_signal 建议在 0.2~0.5 之间")
+        if int(rv.get("frames_per_segment", 4)) < 1:
+            raise ValueError("review.frames_per_segment 至少为 1")
 
 
 def apply_overrides(cfg: dict, args) -> dict:
@@ -136,6 +166,10 @@ def apply_overrides(cfg: dict, args) -> dict:
         c["recognizer"]["game"] = args.game
     if getattr(args, "confidence", None) is not None:
         c["recognizer"]["confidence"] = float(args.confidence)
+    if getattr(args, "review", False):
+        c["review"]["enabled"] = True
+    if getattr(args, "no_review", False):
+        c["review"]["enabled"] = False
     validate(c)
     return c
 

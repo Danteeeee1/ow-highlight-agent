@@ -482,6 +482,7 @@ ow-highlight-agent/
 │   ├── selftest.py           # 合成测试录像 + 真值生成 + 准确率对比
 │   ├── detector.py           # L1 启发式视觉召回（ROI 灰度信号）
 │   ├── model.py              # L1 模型召回：Crispy 预训练击杀检测 + 权重下载
+│   ├── reviewer.py           # L2 语义复核：DeepSeek VLM 看关键帧判定事件/精彩度/解说
 │   ├── audio.py              # L1 音频 RMS 峰值召回
 │   ├── timeline.py           # 片段聚类、打分、Top-K、重叠消解
 │   ├── renderer.py           # FFmpeg 切片/拼接/字幕/BGM
@@ -670,3 +671,73 @@ python gui.py        # 需要该解释器带 tkinter（标准安装自带）和 
 - 双击 bat 后窗口没出现：到项目目录看是否有 `error.log`（启动期异常会写到那里）；确认装了 numpy（`py -3 -m pip install numpy`）后重试。
 - `python gui.py` 报 `No module named tkinter`：说明当前解释器是精简版（如某些嵌入式发行版），换 python.org 官方安装包自带的解释器，或用 `start_gui.bat` 自动挑一个。
 - 冒烟测试：`python test_gui_smoke.py` 会隐藏窗口自动跑参数链路 + demo 全流程 + 结果/日志断言，改完 `gui.py` 后可一键回归。
+
+---
+
+## 18. L2 语义复核（DeepSeek VLM 大模型）
+
+第 16 节的 Crispy MLP 只会回答「这一帧有没有击杀播报」——分不清单杀和五杀、击杀和死亡回放、也不懂什么叫精彩。本节接入**视觉语言大模型**做语义复核：VLM 亲眼看入选片段的关键帧，回答「发生了什么、多精彩」，并把结果融合进最终排序。
+
+### 18.1 工作原理（漏斗架构，成本可控）
+
+```
+整场录像 ──► L1 召回（Crispy/启发式，全帧扫描，廉价）
+              └─► 候选片段 Top-K（默认 ≤ 8 段）
+                    └─► L2 语义复核（本节，每段抽 3~4 张关键帧，一次 VLM 调用）
+                          ├─ 事件类型：团灭/连杀/大招/救援/目标点/单杀/非对局
+                          ├─ VLM 精彩分 0-10 + 连杀数 + 置信度
+                          └─ 一句话中文解说（直接进字幕和报告）
+                                └─► L3 融合打分：w_signal×信号分 + w_vlm×精彩分 + w_event×事件权重
+```
+
+一场 5 分钟录像实测：**34 次信号召回 → 6 段复核 → 69 秒跑完全链路，消耗约 1.8 万 tokens**（几分钱）。VLM 的价值实测示例：
+
+- 源氏开大双杀 → `连杀×2, 精彩 7/10`「源氏开大连续击杀两名敌人」，综合分冲到 0.844 排第一
+- Crispy 报 p=0.99 的「击杀」→ VLM 识破是**死亡回放**，精彩分压到 2/10（MLP 无法区分的误检被语义层拦下）
+- 「死神贴脸输出拿下一杀」——连英雄都认得
+
+### 18.2 启用步骤
+
+```bash
+# ① 配置 API Key（三选一）
+#    a) 桌面 GUI 的「2b · 语义复核」区直接输入（自动保存，推荐）
+#    b) 写入 config.local.json（已被 .gitignore 排除）：
+{"review_api_key": "sk-你的deepseek密钥"}
+#    c) 或环境变量：set OWAGENT_REVIEW_KEY=sk-...
+
+# ② 命令行启用
+python run.py process "D:/videos/xxx.mp4" --recognizer crispy --review
+python run.py process "D:/videos/xxx.mp4" --recognizer crispy --review --dry-run   # 先看复核结果不出片
+```
+
+桌面 GUI 中：勾选「启用 DeepSeek 视觉复核」后，在 **API Key 输入框**粘贴 Key（默认打码显示，可勾「显示」查看）；「测试连接」按钮随时手动验证可用性。**每次开始处理前会自动做一次连通性检测**（调 `/models`，不消耗 tokens）——检测失败时弹窗询问：继续（自动跳过复核）或中止。
+
+桌面 GUI：勾选「2b · 语义复核」即可（Key 状态自检显示在勾选框下方）。
+
+### 18.3 默认模型与参数（config.json → review 段）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `model` | `deepseek-flash` | DeepSeek V4.1-Flash，支持图片输入；`deepseek-v4-pro` 不支持视觉 |
+| `effort` | `low` | 推理力度，low 更快更省，画面判断够用 |
+| `frames_per_segment` | `4` | 每段抽帧数（事件时刻 + 首尾）；击杀播报停留约 4s，抽太少可能错过 |
+| `max_segments` | `8` | 最多复核段数（从已入选段里取前 N） |
+| `concurrency` | `2` | 并发调用数（1-4） |
+| `w_signal/w_vlm/w_event` | `0.35/0.45/0.20` | 融合权重：信号分 / VLM精彩分 / 事件权重 |
+| `drop_non_highlight` | `true` | VLM 明确判定非高光且置信度 ≥0.7 的段直接丢弃（保底不丢光） |
+
+### 18.4 降级与安全
+
+- **Key 缺失 / 网络失败 / 单段超时**：打印警告后自动跳过复核，按纯信号模式出片，**永远不阻塞成片**（与 Crispy 回退启发式同一哲学）
+- 单段失败不影响其他段（每段独立隔离，ThreadPoolExecutor 并发）
+- Key 只存在本地 `config.local.json`（gitignored）或环境变量，**不会进 git**；模型只收到关键帧 JPEG，不接收整段视频
+- `timeline.json` 的每个片段带完整 `review` 字段（事件类型/精彩分/解说/置信度/token 数），可离线分析
+
+### 18.5 调参速查
+
+| 现象 | 处理 |
+|---|---|
+| 好片段被 VLM 压分 | `w_vlm` 降到 0.35，或 `drop_non_highlight: false` |
+| 死亡回放没被拦住 | prompt 里已写 HUD 知识；可把 `frames_per_segment` 提到 5-6 让模型看到更多上下文 |
+| 复核太慢 | `concurrency` 提到 3-4（注意 API 限速），或 `effort` 保持 low、`max_segments` 降到 5 |
+| 解说不满意 | 重跑即可（temperature=0.2 有轻微随机性）；或 `frames_per_segment` 加帧让解说更具体 |

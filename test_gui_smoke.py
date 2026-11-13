@@ -31,6 +31,16 @@ def main() -> int:
     app.var_backend.set("none")
     print("[2] crispy backend override ok")
 
+    # 2b. 语义复核开关链路
+    app.var_review.set(True)
+    cfg_r, _ = app._cfg_with_overrides(video="x.mp4")
+    assert cfg_r["review"]["enabled"] is True
+    assert cfg_r["review"]["max_segments"] == 8
+    app.var_review.set(False)
+    cfg_r2, _ = app._cfg_with_overrides(video="x.mp4")
+    assert cfg_r2["review"]["enabled"] is False
+    print("[2b] review toggle ok")
+
     # 3. 跑 demo 全流程（后台线程，dry-run 模式与真实 GUI 路径一致走队列信号）
     app._set_running(True, "测试中")
     a = gui._make_args(video=str(gui.ROOT / "samples" / "nonexist.mp4"), dry_run=True)

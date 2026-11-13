@@ -45,14 +45,6 @@ echo [2/2] Starting the desktop window (no console needed)...
 set "PYW=!PYEXE:python.exe=pythonw.exe!"
 if not exist "!PYW!" set "PYW=!PYEXE!"
 start "" "!PYW!" gui.py
-if !errorlevel! neq 0 goto :fail
-
-if /i not "%~1"=="--no-pause" (
-    echo.
-    echo Done. The GUI window should appear in 1-3 seconds.
-    echo You can close this console window now.
-    timeout /t 2 >nul
-)
 exit /b 0
 
 :fail

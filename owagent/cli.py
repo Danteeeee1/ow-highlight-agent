@@ -14,6 +14,7 @@ from .config import apply_overrides, load_config, pixel_roi
 from .detector import detect_visual
 from .model import CRISPY_BOXES, ModelNotReady, detect_model, fetch_weights
 from .renderer import make_srt, render
+from .reviewer import ReviewNotReady, review_timeline
 from .selftest import compare, generate
 from .timeline import build_timeline
 from .util import ToolError, fmt_time, log, probe, run_ffmpeg
@@ -65,6 +66,12 @@ def process_video(video: str | Path, args, cfg: dict,
     _write_csv(work_dir / "audio_rms.csv", audio["rms"])
 
     tl = build_timeline(video, visual["events"], audio["events"], meta["duration"], cfg)
+    if cfg.get("review", {}).get("enabled"):
+        try:
+            review_timeline(video, tl, cfg, work_dir)
+        except ReviewNotReady as exc:
+            log(f"语义复核不可用：{exc}", "warn")
+            log("本次跳过复核，按纯信号模式出片（不影响成片）", "warn")
     (work_dir / "timeline.json").write_text(
         json.dumps(tl, ensure_ascii=False, indent=2), encoding="utf-8")
     (work_dir / "captions.srt").write_text(make_srt(tl["selected"]), encoding="utf-8")
@@ -118,6 +125,10 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="crispy 后端的游戏模型（默认 overwatch）")
     p.add_argument("--confidence", type=float,
                    help="crispy 后端的击杀概率阈值（默认 0.6，漏检调低误检调高）")
+    p.add_argument("--review", action="store_true",
+                   help="启用 L2 语义复核（VLM 看关键帧判定事件类型/精彩度，需 API Key）")
+    p.add_argument("--no-review", action="store_true",
+                   help="强制关闭语义复核（覆盖 config.json 里的 review.enabled）")
     p.add_argument("--vertical", action="store_true", help="输出 9:16 竖版 1080x1920")
     p.add_argument("--burn", action="store_true", help="烧录字幕（失败会自动跳过）")
     p.add_argument("--bgm", help="背景音乐文件路径")
@@ -139,6 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
   python run.py process D:/videos/match.mp4 --threshold 0.4 --dry-run
   python run.py fetch-model                   下载 Crispy 预训练模型权重（一次性）
   python run.py process D:/videos/match.mp4 --recognizer crispy
+  python run.py process D:/videos/match.mp4 --recognizer crispy --review   # +VLM 语义复核
 """)
     parser.add_argument("--version", action="version", version=f"OW Highlight Agent {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)

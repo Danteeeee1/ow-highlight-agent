@@ -13,7 +13,7 @@ import wave
 from array import array
 from pathlib import Path
 
-from .util import ToolError, ffmpeg_bin, log
+from .util import NO_WINDOW, ToolError, ffmpeg_bin, log
 
 W, H, FPS, DURATION = 320, 180, 15, 30
 EVENTS = [3.0, 4.0, 5.0, 14.0, 15.0, 25.0, 26.0, 27.0]
@@ -56,7 +56,8 @@ def generate(out_dir: str | Path) -> dict:
                "-ar", "44100", "-shortest", "-movflags", "+faststart", str(video)]
         base = bytearray(bytes((18, 26, 38)) * (W * H))
         with tempfile.TemporaryFile(mode="w+b") as errfile:
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=errfile)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=errfile,
+                                    creationflags=NO_WINDOW)
             assert proc.stdin is not None
             try:
                 for i in range(FPS * DURATION):

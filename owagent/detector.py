@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 from .config import pixel_roi
-from .util import ffmpeg_bin, log, read_exact
+from .util import NO_WINDOW, ffmpeg_bin, log, read_exact
 
 HIGHLIGHT_PIXEL = 170  # grayscale value above which a pixel counts as "HUD ink"
 
@@ -37,7 +37,8 @@ def detect_visual(video: str | Path, cfg: dict, meta: dict) -> dict:
     idx = 0
 
     with tempfile.TemporaryFile(mode="w+b") as errfile:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile,
+                                creationflags=NO_WINDOW)
         assert proc.stdout is not None
         try:
             while True:
