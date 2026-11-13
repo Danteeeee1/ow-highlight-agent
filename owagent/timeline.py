@@ -34,8 +34,9 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
         if end - start < 0.5:
             continue
 
-        vis = [e for e in c["events"] if e["source"] == "visual"]
+        vis = [e for e in c["events"] if e["source"] in ("visual", "model")]
         aud = [e for e in c["events"] if e["source"] == "audio"]
+        mdl = [e for e in c["events"] if e["source"] == "model"]
         base = max((e["strength"] for e in c["events"]), default=0.0)
         combo = min(len(vis) / 4.0, 1.0) if vis else min(len(aud) / 3.0, 1.0) * 0.5
         cross = 1.0 if (vis and aud) else 0.0
@@ -44,7 +45,10 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
         score = 0.40 * base + 0.30 * combo + 0.20 * cross + 0.10 * margin
 
         bits = []
-        if vis:
+        if mdl:
+            bits.append(f"{len(mdl)} 次模型判定击杀"
+                        + (f"（最高 p={max(e['strength'] for e in mdl):.2f}）" if mdl else ""))
+        elif vis:
             bits.append(f"{len(vis)} 次播报")
         if aud:
             bits.append(f"{len(aud)} 次音频峰值")
@@ -129,6 +133,7 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
         "selected_count": len(chosen),
         "total_selected_sec": round(total, 3),
         "config": {"roi": cfg["roi"], "sample": cfg["sample"], "detect": cfg["detect"],
+                   "recognizer": cfg.get("recognizer", {"backend": "none"}),
                    "clip": cfg["clip"], "select": cfg["select"], "render": cfg["render"]},
         "candidates": candidates,
         "selected": chosen,

@@ -12,6 +12,7 @@ from .agent import orchestrate
 from .audio import detect_audio
 from .config import apply_overrides, load_config, pixel_roi
 from .detector import detect_visual
+from .model import CRISPY_BOXES, ModelNotReady, detect_model, fetch_weights
 from .renderer import make_srt, render
 from .selftest import compare, generate
 from .timeline import build_timeline
@@ -47,7 +48,16 @@ def process_video(video: str | Path, args, cfg: dict,
     work_dir.mkdir(parents=True, exist_ok=True)
     out_path = Path(out_path).resolve() if out_path else (work_dir / "highlights.mp4")
 
-    visual = detect_visual(video, cfg, meta)
+    rec = cfg.get("recognizer", {})
+    visual = None
+    if rec.get("backend") == "crispy":
+        try:
+            visual = detect_model(video, cfg, meta)
+        except ModelNotReady as exc:
+            log(f"神经网络识别器不可用：{exc}", "warn")
+            log("本次回退启发式检测（识别器失败不影响出片）", "warn")
+    if visual is None:
+        visual = detect_visual(video, cfg, meta)
     audio = detect_audio(video, cfg, has_audio=meta["has_audio"])
     if audio.get("skipped"):
         log(f"音频通道跳过: {audio['skipped']}", "warn")
@@ -102,6 +112,12 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--post", type=float, help="事件后留白秒数（默认 3）")
     p.add_argument("--gap", type=float, help="相邻事件合并间隔秒数（默认 5）")
     p.add_argument("--no-audio", action="store_true", help="禁用音频通道")
+    p.add_argument("--recognizer", choices=["none", "crispy"],
+                   help="识别后端：none=启发式（默认）/ crispy=Crispy 预训练神经网络")
+    p.add_argument("--game", choices=["overwatch", "csgo2", "valorant"],
+                   help="crispy 后端的游戏模型（默认 overwatch）")
+    p.add_argument("--confidence", type=float,
+                   help="crispy 后端的击杀概率阈值（默认 0.6，漏检调低误检调高）")
     p.add_argument("--vertical", action="store_true", help="输出 9:16 竖版 1080x1920")
     p.add_argument("--burn", action="store_true", help="烧录字幕（失败会自动跳过）")
     p.add_argument("--bgm", help="背景音乐文件路径")
@@ -121,6 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
   python run.py process D:/videos/match.mp4   处理自己的录像
   python run.py roi-preview D:/videos/match.mp4 --time 20
   python run.py process D:/videos/match.mp4 --threshold 0.4 --dry-run
+  python run.py fetch-model                   下载 Crispy 预训练模型权重（一次性）
+  python run.py process D:/videos/match.mp4 --recognizer crispy
 """)
     parser.add_argument("--version", action="version", version=f"OW Highlight Agent {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -145,6 +163,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("process", help="处理一段录像")
     p.add_argument("video")
     _add_common(p)
+
+    p = sub.add_parser("fetch-model",
+                      help="下载 Crispy 预训练模型权重（约 21 MB，一次性）")
+    p.add_argument("--game", default="overwatch",
+                   help="要下载权重的游戏，逗号分隔，或 all（默认 overwatch）")
+    p.add_argument("--dest", help="权重目录（默认 models/crispy）")
     return parser
 
 
@@ -152,6 +176,15 @@ def dispatch(args, cfg: dict) -> int:
     if args.cmd == "self-test":
         gen = generate(args.out_dir)
         print(f"合成录像: {gen['video']}\n真值文件: {gen['truth']}")
+        return 0
+
+    if args.cmd == "fetch-model":
+        games = [g.strip() for g in str(args.game).split(",") if g.strip()]
+        dest = Path(args.dest).resolve() if args.dest else (ROOT / "models" / "crispy")
+        fetch_weights(games, dest)
+        print("\n完成。下一步:")
+        print(f"  python run.py process <录像路径> --recognizer crispy --game {games[0]}")
+        print("  （识别真实录像请先确认画面为 16:9 全屏，权重文件不会被提交到 git）")
         return 0
 
     if args.cmd == "probe":
@@ -163,6 +196,10 @@ def dispatch(args, cfg: dict) -> int:
         print(f"音轨     : {'有' if meta['has_audio'] else '无'}")
         print(f"当前 ROI : 比例 {cfg['roi']['x']},{cfg['roi']['y']},{cfg['roi']['w']},{cfg['roi']['h']}")
         print(f"          像素 x={x} y={y} w={w} h={h}")
+        rec = cfg.get("recognizer", {})
+        game = rec.get("game", "overwatch")
+        ready = (ROOT / "models" / "crispy" / f"{game}.npy").is_file()
+        print(f"识别后端 : {rec.get('backend', 'none')}（{game}，权重{'已就绪' if ready else '未下载，可运行 fetch-model'}）")
         print(f"\n下一步: python run.py roi-preview \"{args.video}\" --time 20")
         return 0
 

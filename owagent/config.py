@@ -10,6 +10,15 @@ DEFAULT_CONFIG = {
         "x": 0.72, "y": 0.05, "w": 0.27, "h": 0.22
     },
     "sample": {"fps": 8, "width": 96, "height": 32},
+    "recognizer": {
+        "_comment": "P1 神经网络识别后端：none=启发式（默认）；crispy=Crispy 预训练击杀检测",
+        "backend": "none",
+        "game": "overwatch",
+        "weights_dir": "models/crispy",
+        "confidence": 0.6,
+        "fps": 8,
+        "stretch": False
+    },
     "detect": {
         "diff_gain": 60.0,
         "rise_gain": 0.25,
@@ -79,6 +88,15 @@ def validate(cfg: dict, meta: dict | None = None) -> None:
         raise ValueError("pre_roll / post_roll 不能为负")
     if cfg["select"]["top_k"] < 1:
         raise ValueError("select.top_k 至少为 1")
+    rec = cfg["recognizer"]
+    if rec["backend"] not in ("none", "crispy"):
+        raise ValueError(f"recognizer.backend 只能是 none / crispy，当前为 {rec['backend']}")
+    if rec["game"] not in ("overwatch", "csgo2", "valorant"):
+        raise ValueError(f"recognizer.game 只能是 overwatch / csgo2 / valorant，当前为 {rec['game']}")
+    if not 0.05 <= float(rec["confidence"]) <= 0.99:
+        raise ValueError("recognizer.confidence 建议在 0.4~0.8 之间")
+    if float(rec["fps"]) <= 0:
+        raise ValueError("recognizer.fps 必须为正数")
 
 
 def apply_overrides(cfg: dict, args) -> dict:
@@ -112,6 +130,12 @@ def apply_overrides(cfg: dict, args) -> dict:
         c["render"]["bgm"] = str(Path(args.bgm).resolve())
     if getattr(args, "llm", False):
         c["agent"]["llm_enabled"] = True
+    if getattr(args, "recognizer", None):
+        c["recognizer"]["backend"] = args.recognizer
+    if getattr(args, "game", None):
+        c["recognizer"]["game"] = args.game
+    if getattr(args, "confidence", None) is not None:
+        c["recognizer"]["confidence"] = float(args.confidence)
     validate(c)
     return c
 

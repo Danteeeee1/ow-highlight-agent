@@ -2,7 +2,7 @@
 
 自动识别《守望先锋》录像里的**击杀播报/高光信号**，把候选片段打分、排序，再用 FFmpeg 剪成一段集锦，并输出时间轴、字幕和决策报告。
 
-> **这是 P0 原型，不是成品识别模型。** 它靠「画面右上角 HUD 区域的像素变化 + 音频能量峰值」做召回，**不认识英雄、不读文字、不理解击杀语义**。目的是用最小依赖把「采集 → 召回 → 打分 → 时间轴 → 剪辑 → 反馈」这条链路完整跑通，给你一个能实测、能调参、能往上接 OCR/VLM/LLM 的底座。
+> **两条识别路线**：默认走「HUD 像素信号 + 音频能量」的零依赖启发式；可选启用 **Crispy 预训练神经网络**（第 16 节）——真实游戏画面训练的击杀检测模型，纯 numpy 推理，支持守望先锋 / CS2 / 瓦罗兰特。启发式路线**不认识英雄、不读文字、不理解击杀语义**，目的是用最小依赖把「采集 → 召回 → 打分 → 时间轴 → 剪辑 → 反馈」这条链路完整跑通。
 
 **本机实测结果**（Windows 11 / Python 3.13.14 / FFmpeg 9.0.2）：
 
@@ -12,7 +12,8 @@
 | 视觉事件召回 | 8 / 8，召回率 **100%**，精确率 **100%**（±1.0s 容差） |
 | 音频峰值召回 | 8 / 8 |
 | 成片 | 3 段无重叠片段、25.26s、H.264 1280×720@30fps + AAC |
-| 额外验证 | 竖版 1080×1920、字幕烧录、BGM 混合、无音轨补静音、LLM 无 Key 降级、dry-run 均通过 |
+| 模型接入验证 | 预处理与 Crispy 原版**逐像素一致（diff=0）**；OW2 风格红色击杀标记触发 p_kill 0.01→0.99；真实 CS2 录像误报 0 |
+| 额外验证 | 竖版 1080×1920、字幕烧录、BGM 混合、无音轨补静音、LLM 无 Key 降级、权重缺失自动回退启发式、dry-run 均通过 |
 
 ---
 
@@ -20,6 +21,7 @@
 
 **能做**
 - 从本地 mp4/录屏中召回「HUD 播报出现」与「音频突变」两类事件
+- 可选：用 Crispy 预训练神经网络做**语义级击杀召回**（真实画面训练，第 16 节）
 - 事件聚类成片段、多维打分、Top-K 选取、按源片时序重排成集锦
 - 输出 MP4、SRT 字幕、时间轴 JSON、逐帧信号 CSV、中文决策报告
 - 可选：9:16 竖版、烧录字幕、混入 BGM、调用 OpenAI 兼容 API 生成解说词
@@ -62,7 +64,9 @@ ffmpeg -version | head -1
 ffprobe -version | head -1
 ```
 
-> **命令行原型零 pip 依赖**。只有使用图形界面（第 15 节）时才需要 `pip install -r requirements.txt`。
+> **命令行原型零 pip 依赖**。两条可选路线才需要装包：
+> - 图形界面（第 15 节）：`pip install -r requirements.txt`
+> - 神经网络识别后端（第 16 节）：`pip install -r requirements-model.txt`（numpy；CS2/瓦罗兰特另需 Pillow）
 
 > Windows 若 `python` 命令不可用，把下文所有 `python` 换成 `py`。
 
@@ -174,6 +178,17 @@ python run.py process "D:/videos/my_match.mp4" --roi 0.70,0.04,0.29,0.24
 | `fps` | 8 | 每秒采样帧数。越低越快、越容易漏短事件；真实录像是 60fps，8fps 足够抓播报条 |
 | `width` / `height` | 96 / 32 | ROI 缩放后的灰度小图尺寸。越大越准但越慢，一般不用改 |
 
+### `recognizer` — 神经网络识别后端（P1 新增）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `backend` | none | `none` = 启发式（零依赖）；`crispy` = Crispy 预训练击杀检测（见第 16 节） |
+| `game` | overwatch | 游戏模型：`overwatch` / `csgo2` / `valorant`，对应各自的 HUD 检测框与权重 |
+| `weights_dir` | models/crispy | 权重目录（相对项目根）。`python run.py fetch-model` 会下载到这里 |
+| `confidence` | 0.6 | 击杀概率阈值。漏检 → 0.4~0.5；误检 → 0.7~0.8（Crispy 官方 release 默认 0.8） |
+| `fps` | 8 | 模型采样帧率（独立于 `sample.fps`） |
+| `stretch` | false | 4:3 拉伸画面（如 CS 玩家的 1440×1080）设为 true，HUD 框坐标会随之调整 |
+
 ### `detect` — 视觉事件判定（调参主战场）
 
 | 字段 | 默认值 | 说明 / 调参方向 |
@@ -264,9 +279,10 @@ python run.py <子命令> [视频路径] [参数]
 |---|---|
 | `demo` | 生成合成录像并跑通全流程 + 真值准确率对比 |
 | `self-test` | 只生成合成录像与真值 JSON（`--out-dir` 指定目录） |
-| `probe <video>` | 打印分辨率、时长、音轨、当前 ROI 像素框 |
+| `probe <video>` | 打印分辨率、时长、音轨、当前 ROI 像素框、识别后端状态 |
 | `roi-preview <video>` | 导出带 ROI 框的 PNG，用于标定 |
 | `process <video>` | 完整处理一段录像 |
+| `fetch-model` | 下载 Crispy 预训练权重（约 21 MB，一次性；`--game` 选游戏或 `all`） |
 
 `process` / `demo` 可用参数（`probe` / `roi-preview` 也接受配置类参数）：
 
@@ -279,6 +295,9 @@ python run.py <子命令> [视频路径] [参数]
 | `--top-k N` | 覆盖最多入选段数 |
 | `--pre F` / `--post F` / `--gap F` | 覆盖前留白 / 后留白 / 合并间隔（秒） |
 | `--no-audio` | 禁用音频通道 |
+| `--recognizer none\|crispy` | 切换识别后端（默认 none；见第 16 节） |
+| `--game overwatch\|csgo2\|valorant` | crispy 后端的游戏模型 |
+| `--confidence F` | crispy 后端的击杀概率阈值 |
 | `--vertical` | 输出 9:16 竖版 |
 | `--burn` | 烧录字幕 |
 | `--bgm PATH` | 混入背景音乐 |
@@ -294,6 +313,9 @@ python run.py <子命令> [视频路径] [参数]
 ```bash
 # 只调参、不花时间编码
 python run.py process match.mp4 --threshold 0.4 --gap 7 --dry-run
+
+# 神经网络识别（先 fetch-model 下载权重）
+python run.py process match.mp4 --recognizer crispy --confidence 0.6 --dry-run
 
 # 抖音/短视频竖版 + 字幕 + BGM
 python run.py process match.mp4 --vertical --burn --bgm ./bgm.mp3 --top-k 5
@@ -419,9 +441,10 @@ FFmpeg 能解的基本都行（mkv / mov / ts / flv…），输出统一 mp4。
 
 代码按层拆开，每一层都能单独替换，不用重写整条链路：
 
-| 层 | 文件 | P0 现在 | 升级方向 |
+| 层 | 文件 | 现状 | 升级方向 |
 |---|---|---|---|
-| 视觉召回 | `owagent/detector.py` | ROI 像素信号 | 接 PaddleOCR/Tesseract 读播报文字；接 YOLO 认英雄图标；接微调 X-CLIP / VLM 对候选窗口做语义复核 |
+| 视觉召回 | `owagent/detector.py` | ROI 像素信号（启发式） | 接 PaddleOCR/Tesseract 读播报文字；接 YOLO 认英雄图标；接微调 X-CLIP / VLM 对候选窗口做语义复核 |
+| 模型召回 | `owagent/model.py` | **Crispy 预训练 MLP 击杀检测（已接入，第 16 节）** | 换更强的时序模型（X-CLIP）；用自己录像的标注微调；多游戏混合召回 |
 | 音频召回 | `owagent/audio.py` | RMS 峰值 | 接 faster-whisper 转写大招语音；按英雄语音线做模板匹配 |
 | 打分 | `owagent/timeline.py` | 加权公式 | 用人工反馈数据训练 LightGBM 学习排序；加残血、加时、占点等特征 |
 | 编排 | `owagent/agent.py` | 规则报告 + 可选 LLM | 接真实工具调用（发布、通知）、人在回路 UI、长期偏好记忆 |
@@ -429,9 +452,9 @@ FFmpeg 能解的基本都行（mkv / mov / ts / flv…），输出统一 mp4。
 | 采集 | `owagent/cli.py` | 本地文件 | 接 OBS 环形缓冲做准实时；批量目录监听 |
 
 **可直接参考的现成项目**
-- [Crispy](https://github.com/Flowtter/crispy)：已支持 OW2 的神经网络高光检测，官方推荐参数就是本原型 `clip` 段的取值来源（confidence 0.6 / 8fps / 前 4s / 后 3s / 击杀间隔 5s）
+- [Crispy](https://github.com/Flowtter/crispy)：OW2 / CS2 / 瓦罗兰特的神经网络高光检测——**本项目的模型召回层（`owagent/model.py`）已接入其预训练权重**，官方推荐参数也是本原型 `clip` 段的取值来源（confidence 0.6 / 8fps / 前 4s / 后 3s / 击杀间隔 5s）
 - [OCRwatch](https://github.com/InventivetalentDev/OCRwatch)：Tesseract 读 OW2 HUD 的参考实现
-- [Gameplay Highlights Generation](https://arxiv.org/abs/2505.07721)（AMD, 2025）：微调 X-CLIP 跨游戏泛化、ONNX + DirectML 在 Windows 部署；论文也指出纯 OCR 路线「每款游戏都要单独工程、跨语言泛化差」，这正是 P1 之后要转向 VLM 的理由
+- [Gameplay Highlights Generation](https://arxiv.org/abs/2505.07721)（AMD, 2025）：微调 X-CLIP 跨游戏泛化、ONNX + DirectML 在 Windows 部署；论文也指出纯 OCR 路线「每款游戏都要单独工程、跨语言泛化差」，这正是后续要转向 VLM 的理由
 
 **建议节奏**：P0 用规则跑通闭环 → P1 用 VLM 提质 → P2 才把 LLM 放进编排层。反过来做（一上来让大模型逐帧看视频）会又贵又不准。
 
@@ -443,7 +466,8 @@ FFmpeg 能解的基本都行（mkv / mov / ts / flv…），输出统一 mp4。
 ow-highlight-agent/
 ├── run.py                    # 命令行入口
 ├── app.py                    # Streamlit 图形界面入口
-├── requirements.txt          # 图形界面唯一依赖：streamlit
+├── requirements.txt          # 图形界面依赖：streamlit
+├── requirements-model.txt    # 神经网络识别后端依赖：numpy (+ pillow)
 ├── start_ui.bat              # Windows 一键启动界面
 ├── .streamlit/config.toml    # 上传上限 / 端口 / 浅色主题
 ├── config.json               # 全部可调参数（也是界面控件默认值）
@@ -453,13 +477,18 @@ ow-highlight-agent/
 │   ├── util.py               # ffmpeg 定位、命令执行、媒体探测、日志
 │   ├── config.py             # 配置加载/校验/命令行覆盖
 │   ├── selftest.py           # 合成测试录像 + 真值生成 + 准确率对比
-│   ├── detector.py           # L1 视觉事件召回（ROI 灰度信号）
+│   ├── detector.py           # L1 启发式视觉召回（ROI 灰度信号）
+│   ├── model.py              # L1 模型召回：Crispy 预训练击杀检测 + 权重下载
 │   ├── audio.py              # L1 音频 RMS 峰值召回
 │   ├── timeline.py           # 片段聚类、打分、Top-K、重叠消解
 │   ├── renderer.py           # FFmpeg 切片/拼接/字幕/BGM
 │   ├── agent.py              # 编排层：决策报告 + 可选 LLM 解说
 │   ├── cli.py                # 命令行子命令与流程编排
 │   └── webui.py              # 界面桥接层（不依赖 streamlit，可单独调用）
+├── models/crispy/            # 预训练权重目录（.npy 不入 git，fetch-model 下载）
+│   ├── SOURCE.md             # 模型来源、MIT 许可与致谢说明
+│   ├── csgo2-mask.png        # CS2 预处理遮罩
+│   └── valorant-mask.png     # 瓦罗兰特预处理遮罩
 ├── samples/                  # demo 生成的合成测试录像与真值
 ├── uploads/                  # 界面上传的临时录像
 └── outputs/                  # 所有产物
@@ -472,12 +501,13 @@ ow-highlight-agent/
 - 本工具是**离线录像分析脚本**，不读取游戏内存、不注入进程、不拦截网络、不修改游戏客户端。
 - 仅建议处理你本人录制、有权使用的画面；公开分享前留意游戏内容版权与队友隐私。
 - 合成测试录像由代码生成，不含任何游戏素材，可放心用于演示与二次开发。
+- 预训练权重来自 MIT 许可的 [Crispy](https://github.com/Flowtter/crispy) 项目（见 `models/crispy/SOURCE.md`），仅用于本地录像分析。
 
 ---
 
 ## 15. 图形界面（Streamlit 本地客户端）
 
-不想记命令的话，用 `app.py` 可以在浏览器里完成全部操作。这是**唯一需要 pip 安装依赖**的部分；检测与剪辑逻辑仍复用同一套 `owagent/` 模块，界面不重复实现任何算法。
+不想记命令的话，用 `app.py` 可以在浏览器里完成全部操作。需要 `pip install -r requirements.txt`；检测与剪辑逻辑仍复用同一套 `owagent/` 模块，界面不重复实现任何算法。
 
 ### 启动
 
@@ -500,10 +530,10 @@ python -m streamlit run app.py --server.port 8700 --server.headless true
 | 区域 | 能做的事 |
 |---|---|
 | 视频来源 | 本地绝对路径 / 上传文件 / 一键生成合成 Demo |
-| 左侧参数栏 | ROI 四个比例、判定阈值、采样帧率、前后留白、合并间隔、Top-K、竖版、烧字幕、BGM、LLM、dry-run、产物目录 |
+| 左侧参数栏 | ROI 四个比例、判定阈值、采样帧率、**识别后端（启发式 / Crispy 神经网络 + 游戏模型 + 击杀概率阈值 + 一键下载权重）**、前后留白、合并间隔、Top-K、竖版、烧字幕、BGM、LLM、dry-run、产物目录 |
 | 辅助按钮 | 「探测视频」看分辨率/时长/音轨；「预览 ROI 框」直接显示带红框的截帧 |
-| 运行过程 | 「开始处理」后实时滚动显示 `[probe] / [detect] / [timeline] / [render] / [agent]` 日志 |
-| 结果区 | 四项指标卡、页面内播放成片、入选片段表格、逐帧 `score / ink_rise / 阈值` 曲线、真值召回率对照 |
+| 运行过程 | 「开始处理」后实时滚动显示 `[probe] / [model] / [detect] / [timeline] / [render] / [agent]` 日志 |
+| 结果区 | 四项指标卡（模型模式显示「模型击杀」数）、页面内播放成片、入选片段表格、逐帧 `score / ink_rise / p_kill / 阈值` 曲线、真值召回率对照 |
 | 下载 | 一键下载 MP4、SRT、timeline.json、决策报告；报告可直接在页面展开阅读 |
 
 ### 推荐操作顺序
@@ -533,3 +563,62 @@ python -m streamlit run app.py --server.port 8700 --server.headless true
 | 成片预览加载不出来 | 文件太大时浏览器解码慢，用「成片 MP4」下载按钮或直接打开 `outputs/<名>/highlights.mp4` |
 | 改了参数没生效 | 参数在点击「开始处理」时才读取，改完要重新点一次 |
 | 界面报错但命令行正常 | 展开运行结果的「运行日志」与错误详情；也可先用 `python run.py demo` 确认底层无问题 |
+
+---
+
+## 16. 神经网络识别后端（Crispy 预训练模型）
+
+P0 的启发式只认「HUD 亮条出现」，不认识画面语义。本节介绍可选的**语义级击杀召回**：接入 [Crispy](https://github.com/Flowtter/crispy)（MIT 许可）发布的预训练神经网络——它就是用真实《守望先锋》等游戏的击杀画面训练的轻量 MLP（10000→120→15→2），每帧输出一个「此刻画面里有没有击杀播报」的概率。
+
+**为什么选它**：任务完全对口（FPS 击杀画面检测）、纯 numpy 推理**不需要 PyTorch/ONNX 等重型框架**、权重只有 9.4 MB、支持守望先锋 / CS2 / 瓦罗兰特、MIT 许可可自由集成。
+
+### 16.1 启用三步
+
+```bash
+# ① 装可选依赖（numpy 必需；CS2/瓦罗兰特另需 pillow）
+pip install -r requirements-model.txt
+
+# ② 下载预训练权重（约 21 MB，一次性；不进 git）
+python run.py fetch-model              # 只要守望先锋
+python run.py fetch-model --game all   # 三个游戏都要
+
+# ③ 用模型跑真实录像（先 dry-run 看召回）
+python run.py process "D:/videos/match.mp4" --recognizer crispy --dry-run
+python run.py process "D:/videos/match.mp4" --recognizer crispy
+```
+
+界面里等价操作：侧栏「神经网络识别」→ 选「Crispy 神经网络」→ 没有权重时点「下载模型权重」→ 开始处理。
+
+### 16.2 它是怎么工作的
+
+| 游戏模型 | HUD 检测框（1920×1080 基准） | 预处理 | 权重 |
+|---|---|---|---|
+| overwatch | 画面中心 (910, 490) 100×100 | 红色通道增强（OW2 击杀确认标记为红/白）→ 灰度 | `overwatch.npy` |
+| csgo2 | 中下 (930, 925) 100×100 | 边缘检测 + 遮罩 | `csgo2.npy` |
+| valorant | 中下 (899, 801) 122×62 | 边缘检测 + 遮罩拼接 | `valorant.npy` |
+
+流程：ffmpeg 先把任意分辨率的帧**归一到 1920×1080**（模型训练时的基准；4:3 拉伸画面用 `stretch: true`），裁出对应游戏的 HUD 框 → 逐帧预处理 → MLP 输出 `p_kill` → **`p_kill` 越过 `confidence` 的上升沿记为一次击杀事件**（`source: "model"`）→ 进入和启发式完全相同的聚类、打分、剪辑流水线。`signals.csv` 在此模式下记录每帧 `t / p_kill`，界面曲线图会画出概率与阈值线。
+
+### 16.3 参数与调参
+
+| 现象 | 处理 |
+|---|---|
+| 整场 `p_kill` 都贴着 0 | 画面不是对应游戏的 16:9 全屏画面；确认录像无黑边、无窗口边框、游戏模型选对 |
+| 击杀漏检 | `--confidence` 降到 0.4~0.5 |
+| 误检偏多 | `--confidence` 升到 0.7~0.8（Crispy 官方 release 默认 0.8） |
+| 连杀只报一次 | 正常：`clip.merge_gap`（默认 5s）内的相邻击杀会合并成一段连杀集锦 |
+| 提示「找不到权重文件」 | 运行 `python run.py fetch-model`；或检查 `recognizer.weights_dir` |
+| numpy / pillow 未安装 | `pip install -r requirements-model.txt`；**权重缺失或依赖缺失都不会中断出片**，会打印警告并自动回退启发式检测 |
+
+### 16.4 本仓库的验证口径
+
+- **预处理等价性**：向量化实现与 Crispy 原版逐像素循环在随机帧上对比，**逐像素差值 = 0**（完全一致，见 `_preprocess_overwatch`）。
+- **正对照**：在 OW2 检测框内合成 OW2 风格红色击杀标记，`p_kill` 从 0.01 升至 **0.99**；小标记（30px）不触发，与 1080p 下真实标记尺寸一致。
+- **负对照**：真实 CS2 录像（无击杀发生的 2.5s 片段）全程 `p_kill ≈ 0.01`，无误报。
+- **回退**：权重/依赖缺失时自动回退启发式并给出明确提示，已实测。
+
+> 局限：MLP 只回答「有没有击杀播报」，不区分多杀/大招/团灭；HUD 版本大改后分布漂移需要重新训练（训练脚本在上游 Crispy 仓库）。这层负责「召回」，语义分级交给后续的 VLM 复核层。
+
+### 16.5 许可与致谢
+
+权重与遮罩文件来自 Crispy release 1.1.4（MIT License），来源、下载方式与致谢见 `models/crispy/SOURCE.md`。本仓库仅复刻其推理管线（`owagent/model.py`），训练数据与权重版权归 Crispy 项目所有。

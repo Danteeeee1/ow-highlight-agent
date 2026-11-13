@@ -45,6 +45,34 @@ with st.sidebar:
                           help="漏检多就调低，误检多就调高")
     fps = st.slider("采样帧率", 2, 16, int(base["sample"]["fps"]), 1)
 
+    with st.expander("神经网络识别（Crispy 预训练）"):
+        st.caption("用真实游戏画面训练的击杀检测模型替代像素启发式；权重不入 git，约 21 MB")
+        backend_label = st.selectbox("识别后端", ["启发式（默认）", "Crispy 神经网络"])
+        use_model = backend_label.startswith("Crispy")
+        game = model_confidence = None
+        if use_model:
+            game = st.selectbox("游戏模型", ["overwatch", "csgo2", "valorant"])
+            model_confidence = st.slider("击杀概率阈值", 0.30, 0.95,
+                                         float(base["recognizer"]["confidence"]), 0.05,
+                                         help="漏检调低，误检调高；Crispy 官方默认 0.6~0.8")
+            mstat = webui.model_status(base, game)
+            if mstat["ready"]:
+                st.caption(f"✓ 权重已就绪（{mstat['game']}）")
+            else:
+                missing = []
+                if not mstat["weights_ok"]:
+                    missing.append("权重未下载")
+                if not mstat["numpy_ok"]:
+                    missing.append("缺 numpy")
+                if not mstat["pillow_ok"]:
+                    missing.append("缺 Pillow")
+                st.warning("，".join(missing))
+                if st.button("下载模型权重（一次性，约 21 MB）"):
+                    with st.spinner("正在下载 Crispy 权重…"):
+                        webui.fetch_model(base, [game])
+                    st.rerun()
+            st.caption("合成 Demo 是程序生成的画面，模型不会命中；请用真实录像验证")
+
     with st.expander("片段切分"):
         pre = st.number_input("事件前留白 (s)", 0.0, 15.0, float(base["clip"]["pre_roll"]), 0.5)
         post = st.number_input("事件后留白 (s)", 0.0, 15.0, float(base["clip"]["post_roll"]), 0.5)
@@ -69,7 +97,9 @@ try:
     cfg = webui.build_config(
         base, roi=(rx, ry, rw, rh), threshold=threshold, fps=fps,
         pre=pre, post=post, gap=gap, top_k=top_k, no_audio=no_audio,
-        vertical=vertical, burn=burn, bgm=bgm, llm=use_llm)
+        vertical=vertical, burn=burn, bgm=bgm, llm=use_llm,
+        recognizer="crispy" if use_model else "none",
+        game=game, model_confidence=model_confidence)
 except ValueError as exc:
     st.error(f"参数不合法：{exc}")
     st.stop()
@@ -178,7 +208,9 @@ if res:
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("入选片段", tl["selected_count"])
     m2.metric("成片时长", f"{tl['total_selected_sec']:.1f} s")
-    m3.metric("视觉事件", tl["event_count"]["visual"])
+    rec_used = cfg_used.get("recognizer", {})
+    m3.metric("模型击杀" if rec_used.get("backend") == "crispy" else "视觉事件",
+              tl["event_count"]["visual"])
     m4.metric("音频事件", tl["event_count"]["audio"])
 
     truth_file = ROOT / "samples" / "demo_truth.json"
@@ -209,11 +241,17 @@ if res:
             frame = pd.read_csv(sig_file)
             if "t" in frame.columns:
                 frame = frame.set_index("t")
-                cols = [c for c in ("score", "ink_rise") if c in frame.columns]
-                frame["threshold"] = cfg_used["detect"]["threshold"]
+                cols = [c for c in ("score", "ink_rise", "p_kill") if c in frame.columns]
+                model_mode = cfg_used.get("recognizer", {}).get("backend") == "crispy"
+                frame["threshold"] = (cfg_used["recognizer"]["confidence"] if model_mode
+                                      else cfg_used["detect"]["threshold"])
                 st.line_chart(frame[cols + ["threshold"]])
-                st.caption("score 越过 threshold 线且 ink_rise 出现尖峰时记为一次播报事件；"
-                           "平静段 ink_rise 应接近 0，否则 ROI 可能框进了高亮背景。")
+                if model_mode:
+                    st.caption("p_kill 是模型输出的击杀概率，越过 threshold 线的上升沿记为一次击杀；"
+                               "整段贴近 0 说明画面不是对应游戏的 16:9 全屏画面。")
+                else:
+                    st.caption("score 越过 threshold 线且 ink_rise 出现尖峰时记为一次播报事件；"
+                               "平静段 ink_rise 应接近 0，否则 ROI 可能框进了高亮背景。")
 
     st.subheader("3. 产物下载")
     wd = Path(res["work_dir"])

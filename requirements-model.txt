@@ -1,0 +1,9 @@
+# Optional dependencies for the learned recognizer backend (P1)
+
+# `--recognizer crispy` needs numpy for MLP inference (already present if you
+# installed the Streamlit UI requirements; listed here for standalone CLI use).
+numpy>=1.24
+
+# Pillow is only needed for csgo2 / valorant preprocessing; the overwatch
+# pipeline is pure numpy.
+pillow>=9.0

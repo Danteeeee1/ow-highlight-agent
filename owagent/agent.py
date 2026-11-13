@@ -66,7 +66,12 @@ def _advice(tl: dict) -> list[str]:
         out.append("没有召回音频峰值：录像可能无音轨，或 `audio.peak_ratio` 过高；音轨是低成本的交叉验证信号。")
     if vis and aud and vis / max(aud, 1) > 6:
         out.append("视觉事件远多于音频事件：可略降 `audio.peak_ratio` 增强双通道确认。")
-    out.append("P0 只做视觉/音频信号召回，不认识英雄与击杀语义；要提质请按 README「升级路径」接入 OCR / VLM。")
+    if tl.get("config", {}).get("recognizer", {}).get("backend") == "crispy":
+        out.append("Crispy 模型召回已启用：无检出时把 `--confidence` 降到 0.4~0.5；"
+                   "误检多则升到 0.7~0.8；并确认录像为 16:9 全屏（模型按 1920x1080 训练）。")
+    else:
+        out.append("P0 只做视觉/音频信号召回，不认识英雄与击杀语义；"
+                    "要提质请按 README「模型识别」一节启用 Crispy 神经网络（--recognizer crispy）。")
     return out
 
 
@@ -79,10 +84,18 @@ def orchestrate(tl: dict, cfg: dict, work_dir: str | Path, render_info: dict | N
         seg["llm_caption"] = captions[i] if captions and i < len(captions) else None
 
     lines: list[str] = []
+    rec = cfg.get("recognizer", {})
+    backend = rec.get("backend", "none")
     lines.append("# 高光剪辑决策报告\n")
     lines.append(f"- 源视频：`{tl['source_video']}`")
     lines.append(f"- 时长：{fmt_time(tl['duration'])}")
-    lines.append(f"- 召回事件：视觉 {tl['event_count']['visual']} 个 / 音频 {tl['event_count']['audio']} 个")
+    if backend == "crispy":
+        lines.append(f"- 识别后端：Crispy 神经网络（{rec.get('game')}，"
+                     f"confidence={rec.get('confidence')}，{tl['event_count']['visual']} 次击杀判定）")
+        lines.append(f"- 召回事件：模型击杀 {tl['event_count']['visual']} 个 / 音频 {tl['event_count']['audio']} 个")
+    else:
+        lines.append(f"- 识别后端：启发式（像素信号）")
+        lines.append(f"- 召回事件：视觉 {tl['event_count']['visual']} 个 / 音频 {tl['event_count']['audio']} 个")
     lines.append(f"- 候选片段：{tl['cluster_count']} 段，入选 **{tl['selected_count']}** 段，合计 {tl['total_selected_sec']:.1f}s")
     if render_info:
         lines.append(f"- 成片：`{render_info['output']}`（{render_info['resolution']}，字幕烧录 {'是' if render_info['subtitles_burned'] else '否'}）")
@@ -122,6 +135,7 @@ def orchestrate(tl: dict, cfg: dict, work_dir: str | Path, render_info: dict | N
     lines.append("## 当前参数快照\n")
     lines.append("```json")
     lines.append(json.dumps({"roi": cfg["roi"], "sample": cfg["sample"],
+                             "recognizer": cfg.get("recognizer", {"backend": "none"}),
                              "detect": cfg["detect"], "clip": cfg["clip"],
                              "select": cfg["select"]}, ensure_ascii=False, indent=2))
     lines.append("```\n")
