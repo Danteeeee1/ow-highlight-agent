@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Streamlit secrets (never commit API keys)
+.streamlit/secrets.toml
+
+# Local overrides / secrets
+.env
+*.local.json
+config.local.json
+
+# Generated media and run artifacts
+outputs/
+uploads/
+samples/*.mp4
+*.log
+
+# Pretrained model weights (download once via: python run.py fetch-model)
+models/crispy/*.npy
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

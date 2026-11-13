@@ -1,0 +1,259 @@
+"""Command line entry points for the OW Highlight Agent prototype."""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from pathlib import Path
+
+from . import __version__
+from .agent import orchestrate
+from .audio import detect_audio
+from .config import apply_overrides, load_config, pixel_roi
+from .detector import detect_visual
+from .model import CRISPY_BOXES, ModelNotReady, detect_model, fetch_weights
+from .renderer import make_srt, render
+from .selftest import compare, generate
+from .timeline import build_timeline
+from .util import ToolError, fmt_time, log, probe, run_ffmpeg
+
+ROOT = Path(__file__).resolve().parent.parent
+SAMPLES = ROOT / "samples"
+OUTPUTS = ROOT / "outputs"
+DEFAULT_CFG = ROOT / "config.json"
+
+
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def process_video(video: str | Path, args, cfg: dict,
+                  work_dir: str | Path | None = None,
+                  out_path: str | Path | None = None) -> dict:
+    video = Path(video).resolve()
+    if not video.is_file():
+        raise ToolError(f"视频文件不存在: {video}")
+    meta = probe(video)
+    log(f"{video.name}  {meta['width']}x{meta['height']}  {fmt_time(meta['duration'])}  "
+        f"音轨={'有' if meta['has_audio'] else '无'}", "probe")
+
+    work_dir = (Path(work_dir) if work_dir else OUTPUTS / video.stem).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out_path = Path(out_path).resolve() if out_path else (work_dir / "highlights.mp4")
+
+    rec = cfg.get("recognizer", {})
+    visual = None
+    if rec.get("backend") == "crispy":
+        try:
+            visual = detect_model(video, cfg, meta)
+        except ModelNotReady as exc:
+            log(f"神经网络识别器不可用：{exc}", "warn")
+            log("本次回退启发式检测（识别器失败不影响出片）", "warn")
+    if visual is None:
+        visual = detect_visual(video, cfg, meta)
+    audio = detect_audio(video, cfg, has_audio=meta["has_audio"])
+    if audio.get("skipped"):
+        log(f"音频通道跳过: {audio['skipped']}", "warn")
+    _write_csv(work_dir / "signals.csv", visual["signals"])
+    _write_csv(work_dir / "audio_rms.csv", audio["rms"])
+
+    tl = build_timeline(video, visual["events"], audio["events"], meta["duration"], cfg)
+    (work_dir / "timeline.json").write_text(
+        json.dumps(tl, ensure_ascii=False, indent=2), encoding="utf-8")
+    (work_dir / "captions.srt").write_text(make_srt(tl["selected"]), encoding="utf-8")
+    log(f"候选 {tl['cluster_count']} 段，入选 {tl['selected_count']} 段 "
+        f"（{tl['total_selected_sec']:.1f}s）", "timeline")
+
+    render_info = None
+    if getattr(args, "dry_run", False):
+        log("dry-run：跳过视频渲染，只输出检测与决策产物", "render")
+    else:
+        render_info = render(video, tl["selected"], out_path, work_dir, cfg, meta)
+
+    agent_info = orchestrate(tl, cfg, work_dir, render_info)
+    (work_dir / "timeline.json").write_text(
+        json.dumps(tl, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"work_dir": str(work_dir), "timeline": tl, "render": render_info,
+            "agent": agent_info, "visual_events": visual["events"], "meta": meta}
+
+
+def _summary(res: dict) -> None:
+    tl = res["timeline"]
+    print("\n" + "=" * 62)
+    print("  完成  |  OW Highlight Agent P0")
+    print("=" * 62)
+    if res["render"]:
+        print(f"  成片     : {res['render']['output']}")
+    print(f"  决策报告 : {res['agent']['report']}")
+    print(f"  时间轴   : {Path(res['work_dir']) / 'timeline.json'}")
+    print(f"  信号数据 : {Path(res['work_dir']) / 'signals.csv'}")
+    print(f"  字幕     : {Path(res['work_dir']) / 'captions.srt'}")
+    print(f"  入选片段 : {tl['selected_count']} 段 / 共 {tl['total_selected_sec']:.1f}s")
+    for seg in tl["selected"]:
+        print(f"    #{seg.get('rank')}  {fmt_time(seg['start'])} → {fmt_time(seg['end'])}  "
+              f"score={seg['score']:.3f}  {seg['reason']}")
+    print("=" * 62 + "\n")
+
+
+def _add_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--config", help="配置文件路径（默认 ./config.json）")
+    p.add_argument("--roi", help="ROI 比例 x,y,w,h，例如 0.72,0.05,0.27,0.22")
+    p.add_argument("--threshold", type=float, help="事件判定阈值（默认 0.55，越低越敏感）")
+    p.add_argument("--fps", type=float, help="采样帧率（默认 8）")
+    p.add_argument("--top-k", type=int, help="最多入选片段数（默认 6）")
+    p.add_argument("--pre", type=float, help="事件前留白秒数（默认 4）")
+    p.add_argument("--post", type=float, help="事件后留白秒数（默认 3）")
+    p.add_argument("--gap", type=float, help="相邻事件合并间隔秒数（默认 5）")
+    p.add_argument("--no-audio", action="store_true", help="禁用音频通道")
+    p.add_argument("--recognizer", choices=["none", "crispy"],
+                   help="识别后端：none=启发式（默认）/ crispy=Crispy 预训练神经网络")
+    p.add_argument("--game", choices=["overwatch", "csgo2", "valorant"],
+                   help="crispy 后端的游戏模型（默认 overwatch）")
+    p.add_argument("--confidence", type=float,
+                   help="crispy 后端的击杀概率阈值（默认 0.6，漏检调低误检调高）")
+    p.add_argument("--vertical", action="store_true", help="输出 9:16 竖版 1080x1920")
+    p.add_argument("--burn", action="store_true", help="烧录字幕（失败会自动跳过）")
+    p.add_argument("--bgm", help="背景音乐文件路径")
+    p.add_argument("--llm", action="store_true", help="启用 LLM 解说词（需设置 API Key）")
+    p.add_argument("--dry-run", action="store_true", help="只检测与决策，不渲染视频")
+    p.add_argument("--workdir", help="产物目录（默认 outputs/<视频名>）")
+    p.add_argument("--out", help="成片输出路径（默认 <workdir>/highlights.mp4）")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="run.py",
+        description="守望先锋高光自动识别与剪辑 Agent · P0 本地原型",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  python run.py demo                          一键生成合成录像并跑通全流程
+  python run.py process D:/videos/match.mp4   处理自己的录像
+  python run.py roi-preview D:/videos/match.mp4 --time 20
+  python run.py process D:/videos/match.mp4 --threshold 0.4 --dry-run
+  python run.py fetch-model                   下载 Crispy 预训练模型权重（一次性）
+  python run.py process D:/videos/match.mp4 --recognizer crispy
+""")
+    parser.add_argument("--version", action="version", version=f"OW Highlight Agent {__version__}")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("demo", help="生成合成测试录像 → 检测 → 剪辑 → 报告 → 准确率对比")
+    _add_common(p)
+
+    p = sub.add_parser("self-test", help="只生成合成测试录像与真值文件")
+    p.add_argument("--out-dir", default=str(SAMPLES), help="输出目录")
+    p.add_argument("--config")
+
+    p = sub.add_parser("probe", help="查看视频信息与建议 ROI")
+    p.add_argument("video")
+    _add_common(p)
+
+    p = sub.add_parser("roi-preview", help="导出带 ROI 框的截图，用于标定")
+    p.add_argument("video")
+    p.add_argument("--time", type=float, default=3.0, help="截帧时间点（秒）")
+    p.add_argument("--png", help="截图输出路径")
+    _add_common(p)
+
+    p = sub.add_parser("process", help="处理一段录像")
+    p.add_argument("video")
+    _add_common(p)
+
+    p = sub.add_parser("fetch-model",
+                      help="下载 Crispy 预训练模型权重（约 21 MB，一次性）")
+    p.add_argument("--game", default="overwatch",
+                   help="要下载权重的游戏，逗号分隔，或 all（默认 overwatch）")
+    p.add_argument("--dest", help="权重目录（默认 models/crispy）")
+    return parser
+
+
+def dispatch(args, cfg: dict) -> int:
+    if args.cmd == "self-test":
+        gen = generate(args.out_dir)
+        print(f"合成录像: {gen['video']}\n真值文件: {gen['truth']}")
+        return 0
+
+    if args.cmd == "fetch-model":
+        games = [g.strip() for g in str(args.game).split(",") if g.strip()]
+        dest = Path(args.dest).resolve() if args.dest else (ROOT / "models" / "crispy")
+        fetch_weights(games, dest)
+        print("\n完成。下一步:")
+        print(f"  python run.py process <录像路径> --recognizer crispy --game {games[0]}")
+        print("  （识别真实录像请先确认画面为 16:9 全屏，权重文件不会被提交到 git）")
+        return 0
+
+    if args.cmd == "probe":
+        meta = probe(args.video)
+        x, y, w, h = pixel_roi(cfg, meta["width"], meta["height"])
+        print(f"文件     : {Path(args.video).resolve()}")
+        print(f"分辨率   : {meta['width']}x{meta['height']}  @ {meta['fps']:.2f}fps")
+        print(f"时长     : {fmt_time(meta['duration'])}")
+        print(f"音轨     : {'有' if meta['has_audio'] else '无'}")
+        print(f"当前 ROI : 比例 {cfg['roi']['x']},{cfg['roi']['y']},{cfg['roi']['w']},{cfg['roi']['h']}")
+        print(f"          像素 x={x} y={y} w={w} h={h}")
+        rec = cfg.get("recognizer", {})
+        game = rec.get("game", "overwatch")
+        ready = (ROOT / "models" / "crispy" / f"{game}.npy").is_file()
+        print(f"识别后端 : {rec.get('backend', 'none')}（{game}，权重{'已就绪' if ready else '未下载，可运行 fetch-model'}）")
+        print(f"\n下一步: python run.py roi-preview \"{args.video}\" --time 20")
+        return 0
+
+    if args.cmd == "roi-preview":
+        meta = probe(args.video)
+        x, y, w, h = pixel_roi(cfg, meta["width"], meta["height"])
+        png = Path(args.png).resolve() if args.png else (OUTPUTS / f"{Path(args.video).stem}_roi.png")
+        png.parent.mkdir(parents=True, exist_ok=True)
+        vf = (f"drawbox=x={x}:y={y}:w={w}:h={h}:color=red@0.9:t=4,"
+              f"drawbox=x={x}:y={y}:w={w}:h={h}:color=yellow@0.6:t=1")
+        run_ffmpeg(["-ss", f"{float(args.time):.3f}", "-i", str(Path(args.video).resolve()),
+                    "-frames:v", "1", "-vf", vf, str(png)])
+        print(f"ROI 截图: {png}\n红框应完整覆盖右上角的击杀播报区域；不合适就用 --roi 调整。")
+        return 0
+
+    if args.cmd == "process":
+        res = process_video(args.video, args, cfg,
+                            work_dir=args.workdir, out_path=args.out)
+        _summary(res)
+        return 0
+
+    if args.cmd == "demo":
+        log("步骤 1/2：生成合成测试录像", "demo")
+        gen = generate(SAMPLES)
+        log("步骤 2/2：跑完整流水线", "demo")
+        res = process_video(gen["video"], args, cfg,
+                            work_dir=args.workdir, out_path=args.out)
+        _summary(res)
+        cmp = compare(res["visual_events"], gen["events"], tol=1.0)
+        print("--- 合成真值对照（验证检测器是否工作） ---")
+        print(f"  真值事件 {cmp['truth']} 个 / 检出 {cmp['detected']} 个 / 命中 {cmp['matched']} 个")
+        print(f"  召回率 {cmp['recall'] * 100:.0f}%   精确率 {cmp['precision'] * 100:.0f}%")
+        print("  （容差 ±1.0s；合成画面是理想信号，真实录像需要调 ROI 与阈值）\n")
+        return 0
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cfg_path = getattr(args, "config", None) or (str(DEFAULT_CFG) if DEFAULT_CFG.is_file() else None)
+    try:
+        cfg = load_config(cfg_path)
+        # self-test needs no overrides; other commands take all common flags
+        if args.cmd != "self-test":
+            cfg = apply_overrides(cfg, args)
+        return dispatch(args, cfg)
+    except (ToolError, FileNotFoundError, ValueError, KeyError) as exc:
+        print(f"\n[错误] {exc}\n", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n已中断", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

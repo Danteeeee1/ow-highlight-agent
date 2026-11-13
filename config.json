@@ -1,0 +1,71 @@
+{
+  "roi": {
+    "x": 0.72,
+    "y": 0.05,
+    "w": 0.27,
+    "h": 0.22
+  },
+  "sample": {
+    "fps": 8,
+    "width": 96,
+    "height": 32
+  },
+  "recognizer": {
+    "backend": "none",
+    "game": "overwatch",
+    "weights_dir": "models/crispy",
+    "confidence": 0.6,
+    "fps": 8,
+    "stretch": false
+  },
+  "detect": {
+    "diff_gain": 60.0,
+    "rise_gain": 0.25,
+    "ink_gain": 0.45,
+    "w_diff": 0.45,
+    "w_rise": 0.40,
+    "w_ink": 0.15,
+    "threshold": 0.55,
+    "min_rise": 0.08,
+    "refractory_sec": 0.6
+  },
+  "audio": {
+    "enabled": true,
+    "sample_rate": 8000,
+    "window_sec": 0.10,
+    "peak_ratio": 2.6,
+    "refractory_sec": 0.5,
+    "baseline_alpha": 0.05,
+    "min_rms": 0.012
+  },
+  "clip": {
+    "pre_roll": 4.0,
+    "post_roll": 3.0,
+    "merge_gap": 5.0,
+    "min_len": 3.0,
+    "max_len": 16.0
+  },
+  "select": {
+    "top_k": 6,
+    "max_total_sec": 90.0,
+    "min_score": 0.0
+  },
+  "render": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "crf": 23,
+    "preset": "veryfast",
+    "vertical": false,
+    "burn_subtitles": false,
+    "bgm": null,
+    "bgm_volume": 0.18
+  },
+  "agent": {
+    "llm_enabled": false,
+    "api_key_env": "OWAGENT_API_KEY",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "timeout_sec": 15
+  }
+}
