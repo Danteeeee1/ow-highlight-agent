@@ -96,6 +96,17 @@ DEFAULT_CONFIG = {
                     "目标用户名取 ocr.player_name，缺省用本人视角锚点的播报击杀者投票。",
         "enabled": True
     },
+    "nameplate": {
+        "_comment": "OW 专属通道：左下角玩家名牌。名牌是唯一持续印着录像者名字的"
+                    "HUD——读到的名字注入 ocr.player_name（用户已配置时不覆盖），"
+                    "并与右上播报行协同：击杀者名=名牌名 → 本人击杀铁证；骷髅头确认"
+                    "事件的 killer 名与名牌名不符则撤销确认。观战他人时名牌换成被观战"
+                    "者名，连续非主名段整段剔除。仅 overwatch 生效；"
+                    "ROI 按 1920x1080 16:9 实测，依赖 rapidocr，缺失自动跳过",
+        "enabled": True,
+        "roi": {"x": 0.031, "y": 0.852, "w": 0.26, "h": 0.13},
+        "fps": 0.5
+    },
     "detect": {
         "diff_gain": 60.0,
         "rise_gain": 0.25,

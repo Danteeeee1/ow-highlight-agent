@@ -38,6 +38,11 @@
   "pov": {
     "enabled": true
   },
+  "nameplate": {
+    "enabled": true,
+    "roi": { "x": 0.031, "y": 0.852, "w": 0.26, "h": 0.13 },
+    "fps": 0.5
+  },
   "detect": {
     "diff_gain": 60.0,
     "rise_gain": 0.25,

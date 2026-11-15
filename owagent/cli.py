@@ -14,6 +14,8 @@ from .config import apply_overrides, load_config, pixel_roi
 from .detector import detect_visual
 from .killcard import KillcardNotReady, detect_killcard
 from .model import CRISPY_BOXES, ModelNotReady, detect_model, fetch_weights
+from .nameplate import (NameplateNotReady, confirm_feed_rows, cross_check_killer,
+                        detect_nameplate)
 from .ocr import OCRNotReady, annotate_selected, detect_ocr
 from .pov import POVNotReady, demote_spectated, detect_pov
 from .redbox import RedboxNotReady, detect_redbox
@@ -104,6 +106,23 @@ def process_video(video: str | Path, args, cfg: dict,
     else:
         visual = detect_visual(video, cfg, meta)
 
+    # OW 专属第八通道（先于 OCR 跑）：左下角玩家名牌。目标用户名直读——
+    # 唯一持续印着录像者名字的 HUD，比播报投票推断可靠；读到的名字注入
+    # ocr.player_name，让后续播报行的 own 判定/玩家名归一/VLM 提示全链路受益。
+    # 名牌同时是视角信号：观战他人时换成被观战者名（同 CS2 底部信息卡）。
+    np_info: dict = {"player": "", "other_pov": [], "reads": []}
+    if cfg.get("nameplate", {}).get("enabled") and cfg.get("recognizer", {}).get("game") == "overwatch":
+        try:
+            np_info = detect_nameplate(video, cfg, meta)
+        except NameplateNotReady as exc:
+            log(f"名牌通道不可用：{exc}", "warn")
+            log("本次跳过名牌识别（不影响出片；安装依赖后重启生效）", "warn")
+        else:
+            if np_info.get("player") and not str(cfg.setdefault("ocr", {}).get("player_name") or "").strip():
+                cfg["ocr"]["player_name"] = np_info["player"]
+                log(f"名牌通道：目标用户名注入 ocr.player_name =「{np_info['player']}」",
+                    "nameplate")
+
     # OCR 第三通道：逐帧读击杀播报文字，拿到 谁杀了谁/连杀数 的确定性信息。
     # mode=full 时作为独立召回通道并入事件流；mode=annotate（默认）在时间轴
     # 构建后只对入选片段 OCR（连杀判定只发生在候选段内，成本大幅降低）。
@@ -117,6 +136,13 @@ def process_video(video: str | Path, args, cfg: dict,
             log(f"OCR 通道不可用：{exc}", "warn")
             log("本次跳过 OCR 识别（不影响出片；安装依赖后重启生效）", "warn")
         if ocr is not None and ocr["events"]:
+            # 名牌×播报协同（full 模式）：击杀者名=目标用户的播报行 =
+            # 录像者本人的击杀铁证，升级为确认事件参与时间轴打分
+            if np_info.get("player"):
+                own_rows = confirm_feed_rows(ocr["events"], np_info["player"])
+                if own_rows:
+                    log(f"名牌×播报协同：{own_rows} 条播报行击杀者=目标用户，"
+                        f"升级为确认玩家击杀", "nameplate")
             before = len(visual["events"])
             visual["events"] = _merge_recall_events(visual["events"], ocr["events"])
             multi = [k for k in ocr["kills"] if k["streak"] >= 2]
@@ -139,6 +165,13 @@ def process_video(video: str | Path, args, cfg: dict,
             log("本次跳过骷髅头识别（不影响出片；安装依赖后重启生效）", "warn")
             skull_events = []
         if skull_events:
+            # 名牌×播报协同校验：确认事件的 killer 名应与名牌读到的目标用户名
+            # 一致（两个独立信号互证）；不匹配 = 形状误检或播报误读，撤销确认。
+            if np_info.get("player"):
+                kept, mismatch = cross_check_killer(skull_events, np_info["player"])
+                if mismatch:
+                    log(f"名牌×播报协同：{kept} 个确认与玩家名一致，"
+                        f"{mismatch} 个 killer 名不符已撤销确认", "nameplate")
             confirmed = [e for e in skull_events if e.get("confirmed")]
             before = len(visual["events"])
             visual["events"] = _merge_recall_events(visual["events"], skull_events)
@@ -225,8 +258,15 @@ def process_video(video: str | Path, args, cfg: dict,
     if ocr is not None:
         _write_csv(work_dir / "ocr_signal.csv", ocr["signals"])
 
+    # 剔除区间：CS2 视角通道 + OW 名牌通道的他人视角段合并
+    exclude = [tuple(iv) for iv in (pov_info.get("other_pov") or [])]
+    exclude += [tuple(iv) for iv in (np_info.get("other_pov") or [])]
     tl = build_timeline(video, visual["events"], audio["events"], meta["duration"], cfg,
-                        ocr=ocr, exclude_intervals=pov_info.get("other_pov"))
+                        ocr=ocr, exclude_intervals=exclude or None)
+    if np_info.get("player"):
+        tl["nameplate"] = {"player": np_info["player"],
+                           "reads": len(np_info.get("reads") or []),
+                           "other_pov": [list(iv) for iv in np_info.get("other_pov", [])]}
     if pov_info.get("windows") or pov_info.get("owner"):
         tl["pov"] = {"owner": pov_info.get("owner", ""),
                      "windows": pov_info.get("windows", []),
@@ -246,6 +286,8 @@ def process_video(video: str | Path, args, cfg: dict,
             _write_csv(work_dir / "ocr_signal.csv", ocr["signals"])
     if ocr is not None and ocr.get("player"):
         tl["player"] = ocr["player"]
+    elif np_info.get("player"):
+        tl["player"] = np_info["player"]      # OCR 未跑/未读到：名牌名兜底
     elif not tl.get("player"):
         # OCR 没跑/没读到名字：骷髅头确认事件自带玩家名（读播报行所得）
         named = [e.get("killer") for e in confirmed_events if e.get("killer")]
