@@ -2,4 +2,4 @@
 
 A dependency-free (Python stdlib + ffmpeg) highlight detection and clipping pipeline.
 """
-__version__ = "0.7.1"
+__version__ = "0.7.2"

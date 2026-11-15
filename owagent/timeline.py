@@ -164,6 +164,16 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
             best = max(cands, key=lambda s: (sum(1 for t in remaining if s <= t <= s + max_len), s))
             windows.append((best, min(best + max_len, end)))
             remaining = [t for t in remaining if not (best <= t <= best + max_len)]
+        # 兜底：贪心 5 窗口耗尽后仍可能有零散事件没被任何窗口覆盖
+        # （实测：76s 大波 25 事件，第 6、7 个事件 187.75/189.4 被静默丢弃，
+        # 导致该击杀时刻在所有候选段里消失）。每个漏网事件补一个专属窗口，
+        # 宁可多一个候选也不能丢事件——召回是一切的上游。
+        for t in remaining:
+            lo, hi = start, end - max_len
+            ws = min(max(t - (max_len - post), lo), hi)
+            win = (ws, min(ws + max_len, end))
+            if win not in windows:
+                windows.append(win)
         if not windows:  # 无视觉事件：保留尾部（音频高潮通常在末尾）
             windows = [(end - max_len, end)]
         for ws, we in windows:
