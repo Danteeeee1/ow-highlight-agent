@@ -8,7 +8,7 @@ import tempfile
 from array import array
 from pathlib import Path
 
-from .util import ffmpeg_bin, log, read_exact
+from .util import NO_WINDOW, ffmpeg_bin, log, read_exact
 
 
 def detect_audio(video: str | Path, cfg: dict, has_audio: bool = True) -> dict:
@@ -32,7 +32,8 @@ def detect_audio(video: str | Path, cfg: dict, has_audio: bool = True) -> dict:
 
     with tempfile.TemporaryFile(mode="w+b") as errfile:
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile,
+                                    creationflags=NO_WINDOW)
         except OSError as exc:
             return {"events": [], "rms": [], "skipped": f"ffmpeg 启动失败: {exc}"}
         assert proc.stdout is not None

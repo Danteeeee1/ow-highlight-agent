@@ -21,12 +21,14 @@ def _llm_captions(selected: list[dict], cfg: dict) -> list[str] | None:
     if not key:
         log(f"未设置环境变量 {a['api_key_env']}，跳过 LLM 解说，使用本地文案", "agent")
         return None
+    game_names = {"overwatch": "守望先锋", "csgo2": "CS2", "valorant": "瓦罗兰特"}
+    game = game_names.get(cfg.get("recognizer", {}).get("game", "overwatch"), "FPS")
     compact = [{"no": s.get("rank"), "start": s["start"], "duration": s["duration"],
                 "score": s["score"], "reason": s["reason"]} for s in selected]
     payload = {
         "model": a["model"],
         "messages": [
-            {"role": "system", "content": "你是《守望先锋》集锦剪辑助理。根据结构化片段信息，为每段写一句不超过 25 字的中文解说词。只输出纯文本，每行一段，行数与片段数一致，不要编号、不要多余说明。"},
+            {"role": "system", "content": f"你是《{game}》集锦剪辑助理。根据结构化片段信息，为每段写一句不超过 25 字的中文解说词。只输出纯文本，每行一段，行数与片段数一致，不要编号、不要多余说明。"},
             {"role": "user", "content": json.dumps(compact, ensure_ascii=False)},
         ],
         "temperature": 0.7,
@@ -72,16 +74,26 @@ def _advice(tl: dict) -> list[str]:
     else:
         out.append("P0 只做视觉/音频信号召回，不认识英雄与击杀语义；"
                     "要提质请按 README「模型识别」一节启用 Crispy 神经网络（--recognizer crispy）。")
+    if tl.get("review_summary"):
+        out.append("语义复核已启用：误杀过多把 `review.w_vlm` 降到 0.35 或 `drop_non_highlight` 关掉；"
+                   "嫌慢把 `review.concurrency` 提到 3-4 或 `frames_per_segment` 降到 3；"
+                   "解说不满意可重跑（模型输出有随机性，temperature 已设 0.2）。")
     return out
 
 
 def orchestrate(tl: dict, cfg: dict, work_dir: str | Path, render_info: dict | None = None) -> dict:
     work_dir = Path(work_dir)
     selected = tl["selected"]
-    captions = _llm_captions(selected, cfg) if cfg["agent"]["llm_enabled"] else None
+    review_sum = tl.get("review_summary") or {}
+    # VLM 复核已产出解说词时不再调纯文本 LLM 重复生成
+    has_review_caps = any(s.get("llm_caption") for s in selected)
+    captions = None
+    if cfg["agent"]["llm_enabled"] and not has_review_caps:
+        captions = _llm_captions(selected, cfg)
     llm_used = bool(captions)
     for i, seg in enumerate(selected):
-        seg["llm_caption"] = captions[i] if captions and i < len(captions) else None
+        if captions and i < len(captions):
+            seg["llm_caption"] = captions[i]
 
     lines: list[str] = []
     rec = cfg.get("recognizer", {})
@@ -90,27 +102,48 @@ def orchestrate(tl: dict, cfg: dict, work_dir: str | Path, render_info: dict | N
     lines.append(f"- 源视频：`{tl['source_video']}`")
     lines.append(f"- 时长：{fmt_time(tl['duration'])}")
     if backend == "crispy":
-        lines.append(f"- 识别后端：Crispy 神经网络（{rec.get('game')}，"
+        from .reviewer import GAME_NAMES
+        game = rec.get("game", "overwatch")
+        lines.append(f"- 识别后端：Crispy 神经网络（{GAME_NAMES.get(game, game)}，"
                      f"confidence={rec.get('confidence')}，{tl['event_count']['visual']} 次击杀判定）")
         lines.append(f"- 召回事件：模型击杀 {tl['event_count']['visual']} 个 / 音频 {tl['event_count']['audio']} 个")
     else:
         lines.append(f"- 识别后端：启发式（像素信号）")
         lines.append(f"- 召回事件：视觉 {tl['event_count']['visual']} 个 / 音频 {tl['event_count']['audio']} 个")
     lines.append(f"- 候选片段：{tl['cluster_count']} 段，入选 **{tl['selected_count']}** 段，合计 {tl['total_selected_sec']:.1f}s")
+    if review_sum:
+        lines.append(f"- 语义复核：{review_sum.get('model')}（{review_sum.get('provider')} 云端），"
+                     f"成功 {review_sum.get('reviewed')} 段 / 丢弃 {review_sum.get('dropped')} 段 / "
+                     f"失败 {review_sum.get('failed')} 段，约 {review_sum.get('total_tokens')} tokens")
     if render_info:
         lines.append(f"- 成片：`{render_info['output']}`（{render_info['resolution']}，字幕烧录 {'是' if render_info['subtitles_burned'] else '否'}）")
     else:
         lines.append("- 成片：未渲染（dry-run 模式）")
-    lines.append(f"- 解说词来源：{'LLM（' + cfg['agent']['model'] + '）' if llm_used else '本地规则文案'}\n")
+    if review_sum:
+        lines.append(f"- 解说词来源：VLM 复核（{review_sum.get('model')}）\n")
+    else:
+        lines.append(f"- 解说词来源：{'LLM（' + cfg['agent']['model'] + '）' if llm_used else '本地规则文案'}\n")
 
     lines.append("## 入选片段（按成片时序）\n")
     if selected:
-        lines.append("| # | 源片时间 | 时长 | 得分 | 判定理由 | 解说词 |")
-        lines.append("|---|---|---|---|---|---|")
-        for seg in selected:
-            cap = seg.get("llm_caption") or "—"
-            lines.append(f"| {seg.get('rank')} | {fmt_time(seg['start'])} → {fmt_time(seg['end'])} | "
-                         f"{seg['duration']:.1f}s | {seg['score']:.3f} | {seg['reason']} | {cap} |")
+        if review_sum:
+            lines.append("| # | 源片时间 | 时长 | 综合分 | 事件 | VLM精彩 | 解说词 |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for seg in selected:
+                rv = seg.get("review") or {}
+                cap = rv.get("commentary") or seg.get("llm_caption") or "—"
+                lines.append(f"| {seg.get('rank')} | {fmt_time(seg['start'])} → {fmt_time(seg['end'])} | "
+                             f"{seg['duration']:.1f}s | {seg['score']:.3f} | "
+                             f"{rv.get('event_label', '—')}"
+                             + (f"×{rv['kill_count']}" if rv.get("kill_count") else "")
+                             + f" | {rv.get('excitement', '—')}/10 | {cap} |")
+        else:
+            lines.append("| # | 源片时间 | 时长 | 得分 | 判定理由 | 解说词 |")
+            lines.append("|---|---|---|---|---|---|")
+            for seg in selected:
+                cap = seg.get("llm_caption") or "—"
+                lines.append(f"| {seg.get('rank')} | {fmt_time(seg['start'])} → {fmt_time(seg['end'])} | "
+                             f"{seg['duration']:.1f}s | {seg['score']:.3f} | {seg['reason']} | {cap} |")
     else:
         lines.append("_无入选片段_")
 
@@ -121,12 +154,27 @@ def orchestrate(tl: dict, cfg: dict, work_dir: str | Path, render_info: dict | N
         lines.append("| 源片时间 | 得分 | 理由 |")
         lines.append("|---|---|---|")
         for c in rejected:
-            lines.append(f"| {fmt_time(c['start'])} | {c['score']:.3f} | {c['reason']} |")
+            extra = f"（{c['drop_reason']}）" if c.get("drop_reason") else ""
+            lines.append(f"| {fmt_time(c['start'])} | {c['score']:.3f} | {c['reason']}{extra} |")
     else:
         lines.append("_无_")
 
     lines.append("\n## 打分公式\n")
-    lines.append("`score = 0.40 × 峰值强度 + 0.30 × 连击度 + 0.20 × 视听交叉确认 + 0.10 × 上下文`\n")
+    if review_sum:
+        from .reviewer import event_names, event_weights
+        rgame = review_sum.get("game") or cfg.get("recognizer", {}).get("game", "overwatch")
+        lines.append("`综合分 = w_signal × 信号分 + w_vlm × (VLM精彩/10) + w_event × 事件权重`\n")
+        lines.append(f"- 权重：w_signal={cfg.get('review', {}).get('w_signal')} / "
+                     f"w_vlm={cfg.get('review', {}).get('w_vlm')} / "
+                     f"w_event={cfg.get('review', {}).get('w_event')}")
+        ew = event_weights(rgame)
+        en = event_names(rgame)
+        chain = " > ".join(f"{en[k]} {ew[k]:.2f}" for k in
+                           sorted(ew, key=ew.get, reverse=True) if k != "not_game")
+        lines.append(f"- 事件权重（{rgame}）：{chain}")
+        lines.append("- VLM 明确判定非高光且置信度 ≥ 0.7 的段会被丢弃（可在 review.drop_non_highlight 关闭）")
+    else:
+        lines.append("`score = 0.40 × 峰值强度 + 0.30 × 连击度 + 0.20 × 视听交叉确认 + 0.10 × 上下文`\n")
     lines.append("- 连击度 = min(同一窗口内视觉事件数 / 4, 1)")
     lines.append("- 视听交叉确认 = 同窗口内同时有视觉与音频事件时为 1")
     lines.append("- 上下文 = 避开片头/片尾 5s 时为 1，否则 0.6")

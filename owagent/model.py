@@ -34,7 +34,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from .util import ToolError, ffmpeg_bin, log, read_exact
+from .util import NO_WINDOW, ToolError, ffmpeg_bin, log, read_exact
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -175,6 +175,30 @@ def canonical_size(stretch: bool) -> tuple[int, int]:
     return (1440, 1080) if stretch else (1920, 1080)
 
 
+def resolve_stretch(cfg: dict, meta: dict) -> bool:
+    """Decide the canonical frame mode from config + video aspect ratio.
+
+    The MLP was trained on frames scaled to 1920x1080 (16:9). Feeding it a
+    4:3 recording naively stretched to 16:9 distorts HUD icons horizontally
+    (~33% wider) and the network stops recognizing them. For 4:3 videos the
+    correct mode is Crispy's "stretch" canonical size 1440x1080, which scales
+    4:3 content uniformly.
+
+    recognizer.stretch accepts True / False / "auto" (default):
+      * "auto"  - pick by aspect ratio (4:3 family -> 1440x1080, else 16:9)
+      * True/False - manual override for players who render stretched
+    """
+    rec = cfg.get("recognizer", {})
+    val = rec.get("stretch", "auto")
+    if val is True:
+        return True
+    if val is False:
+        return False
+    ratio = float(meta["width"]) / max(1, float(meta["height"]))
+    # nearest of 4:3 (1.333) vs 16:9 (1.778)
+    return abs(ratio - 4 / 3) <= abs(ratio - 16 / 9)
+
+
 # --------------------------------------------------------------------------
 # main entry: model-based event recall
 # --------------------------------------------------------------------------
@@ -188,7 +212,7 @@ def detect_model(video: str | Path, cfg: dict, meta: dict) -> dict:
 
     conf = float(rec["confidence"])
     fps = float(rec["fps"])
-    stretch = bool(rec.get("stretch", False))
+    stretch = resolve_stretch(cfg, meta)
     w_dir = weights_dir(cfg)
 
     net = CrispyNetwork(game, w_dir / f"{game}.npy")
@@ -212,7 +236,9 @@ def detect_model(video: str | Path, cfg: dict, meta: dict) -> dict:
     vf = f"fps={fps},scale={cw}:{ch},crop={bw}:{bh}:{bx}:{by}"
     cmd = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
            "-i", str(video), "-vf", vf, "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
-    log(f"Crispy 模型识别 ({game})：归一 {cw}x{ch} → HUD 框 x={bx} y={by} "
+    ar = meta["width"] / max(1, meta["height"])
+    log(f"Crispy 模型识别 ({game})：源 {meta['width']}x{meta['height']} (aspect {ar:.3f}) → "
+        f"归一 {cw}x{ch}{'（4:3 均匀缩放）' if stretch else ''} → HUD 框 x={bx} y={by} "
         f"w={bw} h={bh} @ {fps}fps，confidence={conf}", "model")
 
     events: list[dict] = []
@@ -221,7 +247,8 @@ def detect_model(video: str | Path, cfg: dict, meta: dict) -> dict:
     idx = 0
 
     with tempfile.TemporaryFile(mode="w+b") as errfile:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile,
+                                creationflags=NO_WINDOW)
         assert proc.stdout is not None
         try:
             while True:

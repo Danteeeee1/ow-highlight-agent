@@ -16,7 +16,21 @@
     "weights_dir": "models/crispy",
     "confidence": 0.6,
     "fps": 8,
-    "stretch": false
+    "stretch": "auto"
+  },
+  "ocr": {
+    "enabled": true,
+    "mode": "annotate",
+    "player_name": ""
+  },
+  "skull": {
+    "enabled": true,
+    "fps": 16,
+    "confirm_feed": true
+  },
+  "killcard": {
+    "enabled": true,
+    "roi": { "x": 0.455, "y": 0.862, "w": 0.135, "h": 0.098 }
   },
   "detect": {
     "diff_gain": 60.0,
@@ -47,15 +61,15 @@
   },
   "select": {
     "top_k": 6,
-    "max_total_sec": 90.0,
+    "max_total_sec": 120.0,
     "min_score": 0.0
   },
   "render": {
-    "width": 1280,
-    "height": 720,
-    "fps": 30,
-    "crf": 23,
-    "preset": "veryfast",
+    "width": 0,
+    "height": 0,
+    "fps": 0,
+    "crf": 18,
+    "preset": "medium",
     "vertical": false,
     "burn_subtitles": false,
     "bgm": null,

@@ -14,6 +14,12 @@ class ToolError(RuntimeError):
     """Raised when an external tool is missing or fails."""
 
 
+# Windows 下无控制台进程（pythonw 启动的 GUI）派生 ffmpeg/ffprobe 子进程时，
+# 默认会为每个子进程弹一个控制台黑窗。CREATE_NO_WINDOW 阻止弹窗；
+# 非 Windows 平台传 0 即可（subprocess 接受 0）。
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
 def log(msg: str, stage: str = "info") -> None:
     print(f"[{stage}] {msg}", flush=True)
 
@@ -53,7 +59,8 @@ def ffprobe_bin() -> str:
 
 def run(cmd: list[str], *, stdin=None, stdout=None, stderr=None, check: bool = True):
     """Run a command, capture diagnostics on failure."""
-    proc = subprocess.run(cmd, input=stdin, stdout=stdout, stderr=stderr)
+    proc = subprocess.run(cmd, input=stdin, stdout=stdout, stderr=stderr,
+                          creationflags=NO_WINDOW)
     if check and proc.returncode != 0:
         raise ToolError(f"命令失败 (exit {proc.returncode}): {' '.join(map(str, cmd))}")
     return proc
@@ -64,7 +71,7 @@ def run_ffmpeg(args: list[str], *, cwd: str | None = None, capture: bool = False
     cmd = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y"] + [str(a) for a in args]
     with tempfile.TemporaryFile(mode="w+b") as errfile:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE if capture else None,
-                              stderr=errfile, cwd=cwd)
+                              stderr=errfile, cwd=cwd, creationflags=NO_WINDOW)
         if proc.returncode != 0:
             errfile.seek(0)
             detail = errfile.read().decode("utf-8", "replace").strip()[-2000:]
@@ -77,7 +84,7 @@ def probe(path: str | Path) -> dict:
     cmd = [ffprobe_bin(), "-v", "error", "-show_entries",
            "format=duration:stream=codec_type,width,height,r_frame_rate",
            "-of", "json", str(path)]
-    out = subprocess.check_output(cmd, text=True)
+    out = subprocess.check_output(cmd, text=True, creationflags=NO_WINDOW)
     data = json.loads(out)
     duration = float(data.get("format", {}).get("duration") or 0.0)
     width = height = 0

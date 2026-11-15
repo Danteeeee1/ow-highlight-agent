@@ -12,9 +12,13 @@ from .agent import orchestrate
 from .audio import detect_audio
 from .config import apply_overrides, load_config, pixel_roi
 from .detector import detect_visual
+from .killcard import KillcardNotReady, detect_killcard
 from .model import CRISPY_BOXES, ModelNotReady, detect_model, fetch_weights
+from .ocr import OCRNotReady, annotate_selected, detect_ocr
 from .renderer import make_srt, render
+from .reviewer import ReviewNotReady, review_timeline
 from .selftest import compare, generate
+from .skull import SkullNotReady, detect_skull
 from .timeline import build_timeline
 from .util import ToolError, fmt_time, log, probe, run_ffmpeg
 
@@ -32,6 +36,36 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _merge_recall_events(*channels: list[dict], dedup_sec: float = 1.5) -> list[dict]:
+    """Union of recall channels (model medal / heuristic ink / OCR feed text).
+
+    The channels watch different HUD evidence of the same kill, so either can
+    miss what the others see. Events of any source within `dedup_sec` count as
+    the same kill: keep ONE event, take the max strength, and merge every
+    annotation field (OCR killer/victim/streak, model p_kill) so downstream
+    consumers see the union of what each channel knows.
+    """
+    prio = {"ocr": 0, "killcard": 0, "skull": 1, "model": 2, "visual": 3}  # richest info first
+    out = sorted((e for ch in channels for e in ch), key=lambda e: e["t"])
+    merged: list[dict] = []
+    for e in out:
+        if merged and abs(e["t"] - merged[-1]["t"]) <= dedup_sec:
+            m = merged[-1]
+            m["strength"] = max(m["strength"], e["strength"])
+            for k, v in e.items():
+                if k in ("t", "source", "strength"):
+                    continue
+                if k not in m or m[k] is None:
+                    m[k] = v
+            m["channels"] = sorted(set(m.get("channels", [m["source"]])) | {e["source"]}, key=prio.get)
+            continue
+        keep = dict(e)
+        merged.append(keep)
+    for m in merged:
+        m.setdefault("channels", [m["source"]])
+    return merged
 
 
 def process_video(video: str | Path, args, cfg: dict,
@@ -56,15 +90,99 @@ def process_video(video: str | Path, args, cfg: dict,
         except ModelNotReady as exc:
             log(f"神经网络识别器不可用：{exc}", "warn")
             log("本次回退启发式检测（识别器失败不影响出片）", "warn")
-    if visual is None:
+    model_events = list(visual["events"]) if visual is not None else []
+    if visual is not None:
+        # 双通道召回：启发式盯击杀播报(kill feed) ROI，与模型盯击杀奖牌框互补。
+        # 模型漏检（如奖牌被遮挡/显示过短）时由启发式兜底，反之亦然。
+        heur = detect_visual(video, cfg, meta)
+        before = len(visual["events"])
+        visual["events"] = _merge_recall_events(model_events, heur["events"])
+        log(f"双通道召回合并：模型 {before} + 启发式 {len(heur['events'])} → "
+            f"{len(visual['events'])} 个事件", "model")
+    else:
         visual = detect_visual(video, cfg, meta)
+
+    # OCR 第三通道：逐帧读击杀播报文字，拿到 谁杀了谁/连杀数 的确定性信息。
+    # mode=full 时作为独立召回通道并入事件流；mode=annotate（默认）在时间轴
+    # 构建后只对入选片段 OCR（连杀判定只发生在候选段内，成本大幅降低）。
+    ocr = None
+    ocr_cfg = cfg.get("ocr", {})
+    if ocr_cfg.get("enabled") and ocr_cfg.get("mode", "annotate") == "full":
+        try:
+            ocr = detect_ocr(video, cfg, meta, model_events=model_events,
+                             gate_events=visual["events"])
+        except OCRNotReady as exc:
+            log(f"OCR 通道不可用：{exc}", "warn")
+            log("本次跳过 OCR 识别（不影响出片；安装依赖后重启生效）", "warn")
+        if ocr is not None and ocr["events"]:
+            before = len(visual["events"])
+            visual["events"] = _merge_recall_events(visual["events"], ocr["events"])
+            multi = [k for k in ocr["kills"] if k["streak"] >= 2]
+            log(f"OCR 通道合并：+{len(ocr['events'])} 条具名击杀 → {len(visual['events'])} 个事件"
+                + (f"（{len(multi)} 次连杀，最高 {max(k['streak'] for k in ocr['kills'])} 连杀）"
+                   if ocr["kills"] else ""), "ocr")
+
     audio = detect_audio(video, cfg, has_audio=meta["has_audio"])
     if audio.get("skipped"):
         log(f"音频通道跳过: {audio['skipped']}", "warn")
+
+    # OW 专属第四通道：屏幕中心击杀确认骷髅头（只有击杀者本人能看到）。
+    # 眼窝双孔签名 + 生存期过滤；命中击杀播报出现新行时升级为确认玩家击杀。
+    if cfg.get("skull", {}).get("enabled"):
+        try:
+            skull = detect_skull(video, cfg, meta)
+            skull_events = skull["events"]
+        except SkullNotReady as exc:
+            log(f"骷髅头通道不可用：{exc}", "warn")
+            log("本次跳过骷髅头识别（不影响出片；安装依赖后重启生效）", "warn")
+            skull_events = []
+        if skull_events:
+            confirmed = [e for e in skull_events if e.get("confirmed")]
+            before = len(visual["events"])
+            visual["events"] = _merge_recall_events(visual["events"], skull_events)
+            log(f"骷髅头通道合并：+{len(skull_events)} 个候选（{len(confirmed)} 个确认玩家击杀）"
+                f"→ {len(visual['events'])} 个事件", "skull")
+
+    # CS2 专属第五通道：底部中央回合击杀卡牌（顶卡数字=本回合玩家击杀数）。
+    # 只在其他召回通道的事件时刻前后读数做差分：数字只随玩家自己的击杀增长。
+    if cfg.get("killcard", {}).get("enabled") and cfg.get("recognizer", {}).get("game") == "csgo2":
+        try:
+            kc = detect_killcard(video, cfg, meta, gate_events=visual["events"])
+            kc_events = kc["events"]
+        except KillcardNotReady as exc:
+            log(f"击杀卡牌通道不可用：{exc}", "warn")
+            log("本次跳过击杀卡牌识别（不影响出片；安装依赖后重启生效）", "warn")
+            kc_events = []
+        if kc_events:
+            before = len(visual["events"])
+            visual["events"] = _merge_recall_events(visual["events"], kc_events)
+            total = sum(e["kills"] for e in kc_events)
+            log(f"击杀卡牌通道合并：+{len(kc_events)} 组玩家击杀（共 {total} 杀）"
+                f"→ {len(visual['events'])} 个事件", "killcard")
+
     _write_csv(work_dir / "signals.csv", visual["signals"])
     _write_csv(work_dir / "audio_rms.csv", audio["rms"])
+    if ocr is not None:
+        _write_csv(work_dir / "ocr_signal.csv", ocr["signals"])
 
-    tl = build_timeline(video, visual["events"], audio["events"], meta["duration"], cfg)
+    tl = build_timeline(video, visual["events"], audio["events"], meta["duration"], cfg,
+                        ocr=ocr)
+
+    # annotate 模式：时间轴定型后，只对入选片段读击杀播报（默认模式）
+    if ocr_cfg.get("enabled") and ocr_cfg.get("mode", "annotate") == "annotate":
+        try:
+            ocr = annotate_selected(video, cfg, meta, tl, model_events=model_events)
+        except OCRNotReady as exc:
+            log(f"OCR 通道不可用：{exc}", "warn")
+            log("本次跳过 OCR 识别（不影响出片；安装依赖后重启生效）", "warn")
+        else:
+            _write_csv(work_dir / "ocr_signal.csv", ocr["signals"])
+    if cfg.get("review", {}).get("enabled"):
+        try:
+            review_timeline(video, tl, cfg, work_dir)
+        except ReviewNotReady as exc:
+            log(f"语义复核不可用：{exc}", "warn")
+            log("本次跳过复核，按纯信号模式出片（不影响成片）", "warn")
     (work_dir / "timeline.json").write_text(
         json.dumps(tl, ensure_ascii=False, indent=2), encoding="utf-8")
     (work_dir / "captions.srt").write_text(make_srt(tl["selected"]), encoding="utf-8")
@@ -115,9 +233,20 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--recognizer", choices=["none", "crispy"],
                    help="识别后端：none=启发式（默认）/ crispy=Crispy 预训练神经网络")
     p.add_argument("--game", choices=["overwatch", "csgo2", "valorant"],
-                   help="crispy 后端的游戏模型（默认 overwatch）")
+                   help="游戏类型（默认 overwatch）：决定 crispy 模型权重、VLM 复核提示词、"
+                        "启发式默认 ROI")
     p.add_argument("--confidence", type=float,
                    help="crispy 后端的击杀概率阈值（默认 0.6，漏检调低误检调高）")
+    p.add_argument("--review", action="store_true",
+                   help="启用 L2 语义复核（VLM 看关键帧判定事件类型/精彩度，需 API Key）")
+    p.add_argument("--no-review", action="store_true",
+                   help="强制关闭语义复核（覆盖 config.json 里的 review.enabled）")
+    p.add_argument("--ocr", action="store_true",
+                   help="启用 OCR 通道：逐帧读击杀播报文字，拿到击杀者/被杀者/连杀数"
+                        "（离线 rapidocr，需 requirements-ocr.txt）")
+    p.add_argument("--no-ocr", action="store_true",
+                   help="强制关闭 OCR 通道（覆盖 config.json 里的 ocr.enabled）")
+    p.add_argument("--player", help="你的游戏 ID（OCR 连杀判定与解说词用；默认自动推断）")
     p.add_argument("--vertical", action="store_true", help="输出 9:16 竖版 1080x1920")
     p.add_argument("--burn", action="store_true", help="烧录字幕（失败会自动跳过）")
     p.add_argument("--bgm", help="背景音乐文件路径")
@@ -139,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
   python run.py process D:/videos/match.mp4 --threshold 0.4 --dry-run
   python run.py fetch-model                   下载 Crispy 预训练模型权重（一次性）
   python run.py process D:/videos/match.mp4 --recognizer crispy
+  python run.py process D:/videos/match.mp4 --recognizer crispy --review   # +VLM 语义复核
 """)
     parser.add_argument("--version", action="version", version=f"OW Highlight Agent {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)

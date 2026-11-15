@@ -5,10 +5,21 @@ import copy
 import json
 from pathlib import Path
 
+# 各游戏启发式检测的默认 ROI（比例坐标，覆盖对应游戏的击杀播报区）。
+# 仅在显式指定 --game 且用户没有手动给 --roi / config 覆盖时套用；
+# crispy 后端不使用此 ROI（模型自带 HUD 框）。
+GAME_ROI = {
+    # OW2 击杀播报：右上角
+    "overwatch": {"x": 0.72, "y": 0.05, "w": 0.27, "h": 0.22},
+    # CS2 击杀播报：右上角。y 从 0.06 起——上面的网络统计条(延迟/丢包/FPS)
+    # 每秒跳字，会让墨迹上升启发式产生大量假事件
+    "csgo2": {"x": 0.70, "y": 0.06, "w": 0.29, "h": 0.16},
+    # VALORANT 击杀播报：右侧中部（约屏幕 1/4~2/3 高度处）
+    "valorant": {"x": 0.73, "y": 0.24, "w": 0.26, "h": 0.32},
+}
+
 DEFAULT_CONFIG = {
-    "roi": {
-        "x": 0.72, "y": 0.05, "w": 0.27, "h": 0.22
-    },
+    "roi": dict(GAME_ROI["overwatch"]),
     "sample": {"fps": 8, "width": 96, "height": 32},
     "recognizer": {
         "_comment": "P1 神经网络识别后端：none=启发式（默认）；crispy=Crispy 预训练击杀检测",
@@ -17,7 +28,59 @@ DEFAULT_CONFIG = {
         "weights_dir": "models/crispy",
         "confidence": 0.6,
         "fps": 8,
-        "stretch": False
+        "stretch": "auto"
+    },
+    "review": {
+        "_comment": "L2 语义复核：VLM 看入选片段关键帧，判定事件类型/精彩度并写解说（DeepSeek 云端）",
+        "enabled": False,
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "OWAGENT_REVIEW_KEY",
+        "api_key_file": "config.local.json",
+        "frames_per_segment": 6,
+        "max_segments": 8,
+        "frame_width": 768,
+        "effort": "low",
+        "max_tokens": 8000,
+        "timeout_sec": 180,
+        "concurrency": 2,
+        "drop_non_highlight": True,
+        "w_signal": 0.35,
+        "w_vlm": 0.45,
+        "w_event": 0.20
+    },
+    "ocr": {
+        "_comment": "L1 OCR 通道：读击杀播报文字拿到击杀者/被杀者/连杀数（rapidocr，离线）。"
+                    "mode=annotate 只识别入选片段（默认，快）；mode=full 全片独立召回（慢）。"
+                    "需要 pip install -r requirements-ocr.txt；缺失时自动跳过",
+        "enabled": True,
+        "mode": "annotate",
+        "fps": 1.0,
+        "min_score": 0.5,
+        "still_diff": 2.5,
+        "streak_window": 6.0,
+        "feed_persist_sec": 25.0,
+        "player_name": "",
+        "max_side_len": 320
+    },
+    "skull": {
+        "_comment": "OW 专属通道：屏幕中心击杀确认骷髅头（只有击杀者本人能看到，"
+                    "是最专属的玩家击杀信号）。眼窝双孔签名 + 生存期过滤；"
+                    "confirm_feed 用击杀播报确认并附带击杀者/被击杀者名字。"
+                    "仅 overwatch 生效；依赖 opencv（requirements-ocr.txt），缺失自动跳过",
+        "enabled": True,
+        "fps": 16,
+        "confirm_feed": True
+    },
+    "killcard": {
+        "_comment": "CS2 专属通道：底部中央回合击杀卡牌堆（每杀一张卡，顶卡数字=本回合"
+                    "击杀数，只计录像玩家自己的击杀）。不连续扫描：只在其他召回通道"
+                    "的事件时刻前后读卡牌数字做差分（新卡弹出动画期读数置信度 0.97+）。"
+                    "仅 csgo2 生效；ROI 在 1280x960 4:3 实测，16:9 未验证可调；"
+                    "依赖 rapidocr（requirements-ocr.txt），缺失自动跳过",
+        "enabled": True,
+        "roi": {"x": 0.455, "y": 0.862, "w": 0.135, "h": 0.098}
     },
     "detect": {
         "diff_gain": 60.0,
@@ -37,9 +100,12 @@ DEFAULT_CONFIG = {
         "pre_roll": 4.0, "post_roll": 3.0, "merge_gap": 5.0,
         "min_len": 3.0, "max_len": 16.0
     },
-    "select": {"top_k": 6, "max_total_sec": 90.0, "min_score": 0.0},
+    "select": {"top_k": 6, "max_total_sec": 120.0, "min_score": 0.0},
     "render": {
-        "width": 1280, "height": 720, "fps": 30, "crf": 23, "preset": "veryfast",
+        "_comment": "width/height/fps 为 0 表示跟随源（推荐）：成片保持录像原始分辨率/帧率，"
+                    "不做降采样。crf 18 接近视觉无损；烧字幕时 parts 走近无损中间档，"
+                    "最终画质只由烧录阶段编码一次决定",
+        "width": 0, "height": 0, "fps": 0, "crf": 18, "preset": "medium",
         "vertical": False, "burn_subtitles": False, "bgm": None, "bgm_volume": 0.18
     },
     "agent": {
@@ -93,10 +159,44 @@ def validate(cfg: dict, meta: dict | None = None) -> None:
         raise ValueError(f"recognizer.backend 只能是 none / crispy，当前为 {rec['backend']}")
     if rec["game"] not in ("overwatch", "csgo2", "valorant"):
         raise ValueError(f"recognizer.game 只能是 overwatch / csgo2 / valorant，当前为 {rec['game']}")
+    if rec.get("stretch") not in (True, False, "auto"):
+        raise ValueError('recognizer.stretch 只能是 true / false / "auto"')
     if not 0.05 <= float(rec["confidence"]) <= 0.99:
         raise ValueError("recognizer.confidence 建议在 0.4~0.8 之间")
     if float(rec["fps"]) <= 0:
         raise ValueError("recognizer.fps 必须为正数")
+    oc = cfg.get("ocr", {})
+    if oc.get("mode", "annotate") not in ("annotate", "full"):
+        raise ValueError('ocr.mode 只能是 "annotate" / "full"')
+    if float(oc.get("fps", 1.0)) <= 0:
+        raise ValueError("ocr.fps 必须为正数")
+    if not 0.1 <= float(oc.get("min_score", 0.5)) <= 0.99:
+        raise ValueError("ocr.min_score 建议在 0.3~0.8 之间")
+    if float(oc.get("streak_window", 6.0)) <= 0:
+        raise ValueError("ocr.streak_window 必须为正数")
+    sk = cfg.get("skull", {})
+    if float(sk.get("fps", 16)) <= 0:
+        raise ValueError("skull.fps 必须为正数")
+    rd = cfg.get("render", {})
+    for k in ("width", "height", "fps"):
+        if int(rd.get(k, 0)) < 0:
+            raise ValueError(f"render.{k} 不能为负（0 = 跟随源）")
+    if not 0 <= int(rd.get("crf", 18)) <= 51:
+        raise ValueError("render.crf 必须在 0~51 之间（18 接近视觉无损）")
+    if str(rd.get("preset", "medium")) not in (
+            "ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+            "slow", "slower", "veryslow"):
+        raise ValueError(f"render.preset 不是有效的 x264 预设: {rd.get('preset')}")
+    rv = cfg.get("review", {})
+    if rv.get("enabled"):
+        if rv.get("provider") != "deepseek":
+            raise ValueError(f"review.provider 目前仅支持 deepseek，当前为 {rv.get('provider')}")
+        if not str(rv.get("model", "")).strip():
+            raise ValueError("review.model 不能为空")
+        if not 0.05 <= float(rv.get("w_signal", 0.35)) <= 1:
+            raise ValueError("review.w_signal 建议在 0.2~0.5 之间")
+        if int(rv.get("frames_per_segment", 4)) < 1:
+            raise ValueError("review.frames_per_segment 至少为 1")
 
 
 def apply_overrides(cfg: dict, args) -> dict:
@@ -132,10 +232,26 @@ def apply_overrides(cfg: dict, args) -> dict:
         c["agent"]["llm_enabled"] = True
     if getattr(args, "recognizer", None):
         c["recognizer"]["backend"] = args.recognizer
-    if getattr(args, "game", None):
-        c["recognizer"]["game"] = args.game
+    game_arg = getattr(args, "game", None)
+    if game_arg:
+        c["recognizer"]["game"] = game_arg
+        # 切换到非默认游戏且未手动指定 ROI 时，套用该游戏的启发式默认 ROI。
+        # overwatch 不动 config 里已有的 roi（保持老用户自定义不受影响）；
+        # crispy 后端不读 roi，此切换只影响启发式路径与 ROI 预览。
+        if game_arg != "overwatch" and game_arg in GAME_ROI and not getattr(args, "roi", None):
+            c["roi"] = dict(GAME_ROI[game_arg])
     if getattr(args, "confidence", None) is not None:
         c["recognizer"]["confidence"] = float(args.confidence)
+    if getattr(args, "review", False):
+        c["review"]["enabled"] = True
+    if getattr(args, "no_review", False):
+        c["review"]["enabled"] = False
+    if getattr(args, "ocr", False):
+        c["ocr"]["enabled"] = True
+    if getattr(args, "no_ocr", False):
+        c["ocr"]["enabled"] = False
+    if getattr(args, "player", None):
+        c["ocr"]["player_name"] = str(args.player).strip()
     validate(c)
     return c
 

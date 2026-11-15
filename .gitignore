@@ -31,3 +31,6 @@ Thumbs.db
 desktop.ini
 .idea/
 .vscode/
+
+# Debug probe scripts / extracted frames (session artifacts)
+tmp_frames/
