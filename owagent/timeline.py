@@ -40,8 +40,31 @@ def _split_waves(events: list[dict], wave_gap: float) -> list[list[dict]]:
     return [w for w in waves if w]
 
 
+def _subtract(start: float, end: float,
+              intervals: list[tuple[float, float]] | None) -> list[tuple[float, float]]:
+    """Clip [start, end] against exclude intervals; return surviving pieces.
+
+    Used to drop spectator-view stretches (someone else's POV) from a
+    candidate window before it is emitted.
+    """
+    if not intervals:
+        return [(start, end)]
+    pieces: list[tuple[float, float]] = []
+    cur = start
+    for lo, hi in sorted(intervals):
+        if hi <= cur or lo >= end:
+            continue
+        if lo > cur:
+            pieces.append((cur, min(lo, end)))
+        cur = max(cur, hi)
+    if cur < end:
+        pieces.append((cur, end))
+    return [(s, e) for s, e in pieces if e - s >= 0.5]
+
+
 def build_timeline(video: str | Path, visual_events: list[dict], audio_events: list[dict],
-                   duration: float, cfg: dict, ocr: dict | None = None) -> dict:
+                   duration: float, cfg: dict, ocr: dict | None = None,
+                   exclude_intervals: list[tuple[float, float]] | None = None) -> dict:
     clip = cfg["clip"]
     sel = cfg["select"]
     pre, post = float(clip["pre_roll"]), float(clip["post_roll"])
@@ -105,13 +128,17 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
                       for e in events if "killcard" in (e.get("channels") or [])]
 
         bits = []
-        card_events = [e for e in events if "killcard" in (e.get("channels") or [])]
+        card_events = [e for e in events
+                       if "killcard" in (e.get("channels") or []) and e.get("confirmed")]
+        spectated = [e for e in events if e.get("spectate")]
         if card_events:
             top = max(e.get("streak", 1) for e in card_events)
             bits.append(f"击杀卡牌确认玩家击杀（本回合累计 {top} 杀）")
         elif confirmed:
             killer = confirmed[0].get("killer") or "玩家"
             bits.append(f"骷髅头确认玩家击杀×{len(confirmed)}（{killer}）")
+        if spectated:
+            bits.append(f"含 {len(spectated)} 组观战视角击杀（已撤销确认）")
         if penalized:
             bits.append("无玩家击杀确认（降权）")
         if ocr_kills:
@@ -152,26 +179,16 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
             "selected": False,
         })
 
-    for wv in waves:
-        first = min(e["t"] for e in wv)
-        last = max(e["t"] for e in wv)
-        start = max(0.0, first - pre)
-        end = min(duration, last + post)
-        if end - start < min_len:
-            end = min(duration, start + min_len)
-        end = min(end, duration)
-        if end - start < 0.5:
-            continue
-
+    def _emit_window(events: list[dict], start: float, end: float) -> None:
+        """Emit one candidate window (splitting over-long waves as before)."""
         if end - start <= max_len:
-            _emit(wv, start, end)
-            continue
-
+            _emit(events, start, end)
+            return
         # 超长波：按视觉事件密度产出多个 max_len 窗口（消耗式切分），
         # 每个窗口独立打分为候选，避免一波长战斗只保留 16 秒。
         # 上限 5：一波 76s 的战斗可能有 3~4 个密集击杀区（前中后段），
         # 太少会让中后段的三杀窗口永远轮不上。
-        vis_ts = sorted(e["t"] for e in wv if e["source"] in VIS_SOURCES)
+        vis_ts = sorted(e["t"] for e in events if e["source"] in VIS_SOURCES)
         remaining = list(vis_ts)
         windows: list[tuple[float, float]] = []
         while remaining and len(windows) < 5:
@@ -195,7 +212,25 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
         for ws, we in windows:
             if we - ws < 0.5:
                 continue
-            _emit([e for e in wv if ws <= e["t"] <= we], ws, we)
+            _emit([e for e in events if ws <= e["t"] <= we], ws, we)
+
+    for wv in waves:
+        first = min(e["t"] for e in wv)
+        last = max(e["t"] for e in wv)
+        start = max(0.0, first - pre)
+        end = min(duration, last + post)
+        if end - start < min_len:
+            end = min(duration, start + min_len)
+
+        # 观战他人视角剔除：把窗口按排除区间切开，只保留本人视角的部分；
+        # 事件同样只留切后窗口内的（被观战者的击杀不进任何候选段）
+        for s2, e2 in _subtract(start, end, exclude_intervals):
+            if e2 - s2 < 0.5:
+                continue
+            wv2 = [e for e in wv if s2 <= e["t"] <= e2]
+            if not wv2:
+                continue
+            _emit_window(wv2, s2, e2)
 
     ranked = sorted(candidates, key=lambda c: c["score"], reverse=True)
     chosen: list[dict] = []

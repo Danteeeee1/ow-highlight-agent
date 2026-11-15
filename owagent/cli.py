@@ -15,6 +15,8 @@ from .detector import detect_visual
 from .killcard import KillcardNotReady, detect_killcard
 from .model import CRISPY_BOXES, ModelNotReady, detect_model, fetch_weights
 from .ocr import OCRNotReady, annotate_selected, detect_ocr
+from .pov import POVNotReady, demote_spectated, detect_pov
+from .redbox import RedboxNotReady, detect_redbox
 from .renderer import make_srt, render
 from .reviewer import ReviewNotReady, review_timeline
 from .selftest import compare, generate
@@ -47,7 +49,7 @@ def _merge_recall_events(*channels: list[dict], dedup_sec: float = 1.5) -> list[
     annotation field (OCR killer/victim/streak, model p_kill) so downstream
     consumers see the union of what each channel knows.
     """
-    prio = {"ocr": 0, "killcard": 0, "skull": 1, "model": 2, "visual": 3}  # richest info first
+    prio = {"ocr": 0, "killcard": 0, "redbox": 0, "skull": 1, "model": 2, "visual": 3}  # richest info first
     out = sorted((e for ch in channels for e in ch), key=lambda e: e["t"])
     merged: list[dict] = []
     for e in out:
@@ -145,6 +147,7 @@ def process_video(video: str | Path, args, cfg: dict,
 
     # CS2 专属第五通道：底部中央回合击杀卡牌（顶卡数字=本回合玩家击杀数）。
     # 只在其他召回通道的事件时刻前后读数做差分：数字只随玩家自己的击杀增长。
+    kc_events: list[dict] = []
     if cfg.get("killcard", {}).get("enabled") and cfg.get("recognizer", {}).get("game") == "csgo2":
         try:
             kc = detect_killcard(video, cfg, meta, gate_events=visual["events"])
@@ -152,13 +155,66 @@ def process_video(video: str | Path, args, cfg: dict,
         except KillcardNotReady as exc:
             log(f"击杀卡牌通道不可用：{exc}", "warn")
             log("本次跳过击杀卡牌识别（不影响出片；安装依赖后重启生效）", "warn")
-            kc_events = []
-        if kc_events:
-            before = len(visual["events"])
-            visual["events"] = _merge_recall_events(visual["events"], kc_events)
-            total = sum(e["kills"] for e in kc_events)
-            log(f"击杀卡牌通道合并：+{len(kc_events)} 组玩家击杀（共 {total} 杀）"
-                f"→ {len(visual['events'])} 个事件", "killcard")
+
+    # CS2 专属第六通道：右上击杀播报红框（当前视角玩家的击杀行整行红框）。
+    # 与击杀卡牌同一批门控时刻读数，纯像素无 OCR；红框+卡牌变化=视角玩家的击杀。
+    rb_events: list[dict] = []
+    if cfg.get("redbox", {}).get("enabled") and cfg.get("recognizer", {}).get("game") == "csgo2":
+        try:
+            rb = detect_redbox(video, cfg, meta, gate_events=visual["events"])
+            rb_events = rb["events"]
+        except RedboxNotReady as exc:
+            log(f"击杀红框通道不可用：{exc}", "warn")
+            log("本次跳过击杀红框识别（不影响出片；安装依赖后重启生效）", "warn")
+
+    # 红框×卡牌互证（合并前在各自事件上打标，合并只搬运结果）：
+    # 卡牌有差分但无红框 → 撤销确认（可能是误读/非视角玩家击杀）；
+    # 有红框但卡牌无差分 → 只作召回不确认（红框可持续 5-10s，避免滞留框虚增击杀）。
+    # 红框通道全程零命中时视为通道失效，不做互证降级（保持旧行为）。
+    if kc_events and rb_events:
+        for e in kc_events:
+            if e.get("confirmed") and not any(abs(e["t"] - r["t"]) <= 3.5 for r in rb_events):
+                e["confirmed"] = False
+                e["no_redbox"] = True
+        for e in rb_events:
+            if not any(abs(e["t"] - k["t"]) <= 2.5 for k in kc_events):
+                e["confirmed"] = False
+        demoted = sum(1 for e in kc_events if e.get("no_redbox"))
+        if demoted:
+            log(f"红框×卡牌互证：{demoted} 组卡牌事件无红框佐证，已撤销确认", "redbox")
+
+    # CS2 专属第七通道：视角判定。死亡观战/GOTV 期间红框与卡牌跟随"被观看者"，
+    # 据此撤销观战他人视角的击杀确认，并把整段观战区间从成片中剔除。
+    # 注意必须放在互证之后、两通道合并之前：互证/视角都改源事件，合并只搬运。
+    pov_info: dict = {"windows": [], "anchor_views": {}, "owner": "",
+                      "other_pov": [], "reads": 0}
+    if cfg.get("pov", {}).get("enabled") and cfg.get("recognizer", {}).get("game") == "csgo2":
+        anchors = [e for e in list(kc_events) + list(rb_events) if e.get("confirmed")]
+        try:
+            pov_info = detect_pov(video, cfg, meta, anchor_events=anchors)
+        except POVNotReady as exc:
+            log(f"视角通道不可用：{exc}", "warn")
+            log("本次跳过视角判定（不影响出片；安装依赖后重启生效）", "warn")
+
+    if kc_events:
+        before = len(visual["events"])
+        visual["events"] = _merge_recall_events(visual["events"], kc_events)
+        total = sum(e["kills"] for e in kc_events)
+        log(f"击杀卡牌通道合并：+{len(kc_events)} 组玩家击杀（共 {total} 杀）"
+            f"→ {len(visual['events'])} 个事件", "killcard")
+    if rb_events:
+        before = len(visual["events"])
+        visual["events"] = _merge_recall_events(visual["events"], rb_events)
+        log(f"击杀红框通道合并：+{len(rb_events)} 组红框击杀 → {len(visual['events'])} 个事件",
+            "redbox")
+
+    if pov_info.get("windows"):
+        demoted = demote_spectated(visual["events"], pov_info)
+        if demoted:
+            names = sorted({e.get("spectate", "?") for e in visual["events"]
+                            if e.get("spectate")})
+            log(f"视角判定：撤销 {demoted} 组观战视角击杀确认"
+                f"（被观战者：{'、'.join(names)}）", "pov")
 
     # HUD 私有确认事件（骷髅头/击杀卡牌）：时刻即"录像玩家本人击杀"的铁证，
     # 供 OCR annotate 玩家名推断与 VLM 玩家提示使用
@@ -170,7 +226,13 @@ def process_video(video: str | Path, args, cfg: dict,
         _write_csv(work_dir / "ocr_signal.csv", ocr["signals"])
 
     tl = build_timeline(video, visual["events"], audio["events"], meta["duration"], cfg,
-                        ocr=ocr)
+                        ocr=ocr, exclude_intervals=pov_info.get("other_pov"))
+    if pov_info.get("windows") or pov_info.get("owner"):
+        tl["pov"] = {"owner": pov_info.get("owner", ""),
+                     "windows": pov_info.get("windows", []),
+                     "other_pov": [list(iv) for iv in pov_info.get("other_pov", [])],
+                     "spectated_kills": {str(e["t"]): e.get("spectate", "")
+                                         for e in visual["events"] if e.get("spectate")}}
 
     # annotate 模式：时间轴定型后，只对入选片段读击杀播报（默认模式）
     if ocr_cfg.get("enabled") and ocr_cfg.get("mode", "annotate") == "annotate":

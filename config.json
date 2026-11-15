@@ -32,6 +32,12 @@
     "enabled": true,
     "roi": { "x": 0.455, "y": 0.862, "w": 0.135, "h": 0.098 }
   },
+  "redbox": {
+    "enabled": true
+  },
+  "pov": {
+    "enabled": true
+  },
   "detect": {
     "diff_gain": 60.0,
     "rise_gain": 0.25,
