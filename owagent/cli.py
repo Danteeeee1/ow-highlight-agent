@@ -72,20 +72,193 @@ def _merge_recall_events(*channels: list[dict], dedup_sec: float = 1.5) -> list[
     return merged
 
 
-def process_video(video: str | Path, args, cfg: dict,
+def process_video(video: str | Path | list, args, cfg: dict,
                   work_dir: str | Path | None = None,
                   out_path: str | Path | None = None) -> dict:
-    video = Path(video).resolve()
-    if not video.is_file():
-        raise ToolError(f"视频文件不存在: {video}")
-    meta = probe(video)
-    log(f"{video.name}  {meta['width']}x{meta['height']}  {fmt_time(meta['duration'])}  "
-        f"音轨={'有' if meta['has_audio'] else '无'}", "probe")
+    """Process ONE video or a LIST of same-game recordings into ONE reel.
 
-    work_dir = (Path(work_dir) if work_dir else OUTPUTS / video.stem).resolve()
+    Multi-source mode ("virtual concatenation"): every source runs the full
+    detection stack on its own local timeline; events are then offset onto a
+    global axis (e["t"] += offset_i, e["src"] = i) and a single timeline is
+    built across all of them. Candidates never straddle a source boundary,
+    and each carries src_video + LOCAL start/end so rendering, VLM review
+    and OCR annotation go back to the right file. Best results when all
+    sources share resolution/fps (same recording setup).
+    """
+    raw = list(video) if isinstance(video, (list, tuple)) else [video]
+    videos = [Path(v).resolve() for v in raw if str(v).strip()]
+    if not videos:
+        raise ToolError("没有可用的输入视频。")
+    for v in videos:
+        if not v.is_file():
+            raise ToolError(f"视频文件不存在: {v}")
+    metas = [probe(v) for v in videos]
+    multi = len(videos) > 1
+    for i, (v, m) in enumerate(zip(videos, metas), 1):
+        log(f"[素材 {i}/{len(videos)}] {v.name}  {m['width']}x{m['height']}  "
+            f"{fmt_time(m['duration'])}  音轨={'有' if m['has_audio'] else '无'}", "probe")
+    if multi:
+        res_all = {m["width"] == metas[0]["width"] and m["height"] == metas[0]["height"]
+                   for m in metas}
+        if len(res_all) > 1:
+            log("多素材分辨率不一致：将以第一个素材的分辨率为准统一缩放（建议用同设置录制）",
+                "warn")
+
+    stem = f"{videos[0].stem}_x{len(videos)}" if multi else videos[0].stem
+    work_dir = (Path(work_dir) if work_dir else OUTPUTS / stem).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     out_path = Path(out_path).resolve() if out_path else (work_dir / "highlights.mp4")
 
+    # ---- 每条素材独立跑完整检测栈（事件保持素材内局部时间） ----
+    sources: list[dict] = []
+    all_visual: list[dict] = []
+    all_audio: list[dict] = []
+    all_exclude: list[tuple[float, float]] = []
+    det_by_src: list[dict] = []
+    np_player = ""
+    offset = 0.0
+    ocr_cfg = cfg.get("ocr", {})
+    for i, (v, m) in enumerate(zip(videos, metas)):
+        det = _detect_source(v, m, cfg)
+        det_by_src.append(det)
+        if det["np_player"] and not np_player:
+            np_player = det["np_player"]
+        for e in det["visual_events"]:
+            e2 = dict(e)
+            e2["t"] = round(float(e["t"]) + offset, 3)
+            e2["src"] = i
+            all_visual.append(e2)
+        for e in det["audio_events"]:
+            e2 = dict(e)
+            e2["t"] = round(float(e["t"]) + offset, 3)
+            e2["src"] = i
+            all_audio.append(e2)
+        for lo, hi in det["exclude"]:
+            all_exclude.append((lo + offset, hi + offset))
+        sources.append({"offset": offset, "duration": float(m["duration"]),
+                        "video": str(v)})
+        offset += float(m["duration"])
+        suffix = "" if not multi else f"_s{i + 1}"
+        _write_csv(work_dir / f"signals{suffix}.csv", det["signals"])
+        _write_csv(work_dir / f"audio_rms{suffix}.csv", det["rms"])
+        if det.get("ocr") is not None:
+            _write_csv(work_dir / f"ocr_signal{suffix}.csv", det["ocr"].get("signals") or [])
+    if multi:
+        log(f"多素材合并：{len(videos)} 条共 {fmt_time(offset)}，"
+            f"召回 {len(all_visual)} 视觉 / {len(all_audio)} 音频事件", "probe")
+
+    # 全局确认事件 → 按素材还原局部时间（OCR annotate 锚点投票按源进行）
+    confirmed_by_src: list[list[dict]] = [[] for _ in videos]
+    for e in all_visual:
+        if e.get("confirmed"):
+            off = sources[e["src"]]["offset"]
+            confirmed_by_src[e["src"]].append(
+                {"t": round(e["t"] - off, 3), "confirmed": True,
+                 "killer": e.get("killer", ""), "kills": e.get("kills", 1)})
+
+    tl = build_timeline(str(videos[0]), all_visual, all_audio, offset, cfg,
+                        ocr=None, exclude_intervals=all_exclude or None,
+                        sources=sources)
+
+    # 视角/名牌信息汇总（多源时全局化展示）
+    pov_owner = ""
+    pov_windows: list[dict] = []
+    np_reads = 0
+    for i, det in enumerate(det_by_src):
+        off = sources[i]["offset"]
+        p = det.get("pov") or {}
+        if p.get("owner") and not pov_owner:
+            pov_owner = p["owner"]
+        for w in p.get("windows") or []:
+            pov_windows.append({
+                "src": i,
+                "start": round(w["start"] + off, 2), "end": round(w["end"] + off, 2),
+                "names": [dict(n, t=round(n["t"] + off, 1)) for n in w["names"]]})
+        np_reads += len(det.get("np_info", {}).get("reads") or [])
+    if pov_windows or pov_owner:
+        spectated = {str(e["t"]): e.get("spectate", "")
+                     for e in all_visual if e.get("spectate")}
+        tl["pov"] = {"owner": pov_owner, "windows": pov_windows,
+                     "other_pov": [list(iv) for iv in all_exclude],
+                     "spectated_kills": spectated}
+    if np_player:
+        np_other = [iv for det in det_by_src
+                    for iv in (det.get("np_info", {}).get("other_pov") or [])]
+        tl["nameplate"] = {"player": np_player, "reads": np_reads,
+                           "other_pov": [list(iv) for iv in np_other]}
+
+    # annotate 模式：时间轴定型后，只对入选片段读击杀播报（按源分组回源）
+    ocr = None
+    if ocr_cfg.get("enabled") and ocr_cfg.get("mode", "annotate") == "annotate":
+        try:
+            if not multi:
+                ocr = annotate_selected(videos[0], cfg, metas[0], tl,
+                                        model_events=det_by_src[0]["model_events"],
+                                        confirmed_events=confirmed_by_src[0])
+            else:
+                merged = {"events": [], "kills": [], "signals": [], "player": ""}
+                for i, (v, m) in enumerate(zip(videos, metas)):
+                    segs_i = [s for s in tl["selected"]
+                              if s.get("src", 0) == i and s.get("duration", 0) > 0]
+                    if not segs_i:
+                        continue
+                    res = annotate_selected(v, cfg, m, {"selected": segs_i},
+                                            model_events=det_by_src[i]["model_events"],
+                                            confirmed_events=confirmed_by_src[i])
+                    for k in ("events", "kills", "signals"):
+                        merged[k] = merged[k] + list(res.get(k) or [])
+                    if res.get("player") and not merged["player"]:
+                        merged["player"] = res["player"]
+                if merged["events"] or merged["kills"]:
+                    ocr = merged
+        except OCRNotReady as exc:
+            log(f"OCR 通道不可用：{exc}", "warn")
+            log("本次跳过 OCR 识别（不影响出片；安装依赖后重启生效）", "warn")
+        else:
+            if ocr is not None:
+                _write_csv(work_dir / "ocr_signal.csv", ocr.get("signals") or [])
+    if ocr is None:  # full 模式：结果在各源检测里，取第一个有玩家名的作报告用
+        for det in det_by_src:
+            if det.get("ocr") and det["ocr"].get("player"):
+                ocr = det["ocr"]
+                break
+    if ocr is not None and ocr.get("player"):
+        tl["player"] = ocr["player"]
+    elif np_player:
+        tl["player"] = np_player      # OCR 未跑/未读到：名牌名兜底
+    elif not tl.get("player"):
+        # OCR 没跑/没读到名字：骷髅头确认事件自带玩家名（读播报行所得）
+        named = [e.get("killer") for e in all_visual
+                 if e.get("confirmed") and e.get("killer")]
+        if named:
+            tl["player"] = max(set(named), key=named.count)
+    if cfg.get("review", {}).get("enabled"):
+        try:
+            review_timeline(videos[0], tl, cfg, work_dir)
+        except ReviewNotReady as exc:
+            log(f"语义复核不可用：{exc}", "warn")
+            log("本次跳过复核，按纯信号模式出片（不影响成片）", "warn")
+    (work_dir / "timeline.json").write_text(
+        json.dumps(tl, ensure_ascii=False, indent=2), encoding="utf-8")
+    (work_dir / "captions.srt").write_text(make_srt(tl["selected"]), encoding="utf-8")
+    log(f"候选 {tl['cluster_count']} 段，入选 {tl['selected_count']} 段 "
+        f"（{tl['total_selected_sec']:.1f}s）", "timeline")
+
+    render_info = None
+    if getattr(args, "dry_run", False):
+        log("dry-run：跳过视频渲染，只输出检测与决策产物", "render")
+    else:
+        render_info = render(videos[0], tl["selected"], out_path, work_dir, cfg, metas[0])
+
+    agent_info = orchestrate(tl, cfg, work_dir, render_info)
+    (work_dir / "timeline.json").write_text(
+        json.dumps(tl, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"work_dir": str(work_dir), "timeline": tl, "render": render_info,
+            "agent": agent_info, "visual_events": all_visual, "meta": metas[0]}
+
+
+def _detect_source(video: Path, meta: dict, cfg: dict) -> dict:
+    """Run the full detection stack on ONE source (local timeline)."""
     rec = cfg.get("recognizer", {})
     visual = None
     if rec.get("backend") == "crispy":
@@ -249,73 +422,14 @@ def process_video(video: str | Path, args, cfg: dict,
             log(f"视角判定：撤销 {demoted} 组观战视角击杀确认"
                 f"（被观战者：{'、'.join(names)}）", "pov")
 
-    # HUD 私有确认事件（骷髅头/击杀卡牌）：时刻即"录像玩家本人击杀"的铁证，
-    # 供 OCR annotate 玩家名推断与 VLM 玩家提示使用
-    confirmed_events = [e for e in visual["events"] if e.get("confirmed")]
-
-    _write_csv(work_dir / "signals.csv", visual["signals"])
-    _write_csv(work_dir / "audio_rms.csv", audio["rms"])
-    if ocr is not None:
-        _write_csv(work_dir / "ocr_signal.csv", ocr["signals"])
-
-    # 剔除区间：CS2 视角通道 + OW 名牌通道的他人视角段合并
+    # 排除区间：CS2 视角通道 + OW 名牌通道的他人视角段（素材内局部时间）
     exclude = [tuple(iv) for iv in (pov_info.get("other_pov") or [])]
     exclude += [tuple(iv) for iv in (np_info.get("other_pov") or [])]
-    tl = build_timeline(video, visual["events"], audio["events"], meta["duration"], cfg,
-                        ocr=ocr, exclude_intervals=exclude or None)
-    if np_info.get("player"):
-        tl["nameplate"] = {"player": np_info["player"],
-                           "reads": len(np_info.get("reads") or []),
-                           "other_pov": [list(iv) for iv in np_info.get("other_pov", [])]}
-    if pov_info.get("windows") or pov_info.get("owner"):
-        tl["pov"] = {"owner": pov_info.get("owner", ""),
-                     "windows": pov_info.get("windows", []),
-                     "other_pov": [list(iv) for iv in pov_info.get("other_pov", [])],
-                     "spectated_kills": {str(e["t"]): e.get("spectate", "")
-                                         for e in visual["events"] if e.get("spectate")}}
-
-    # annotate 模式：时间轴定型后，只对入选片段读击杀播报（默认模式）
-    if ocr_cfg.get("enabled") and ocr_cfg.get("mode", "annotate") == "annotate":
-        try:
-            ocr = annotate_selected(video, cfg, meta, tl, model_events=model_events,
-                                    confirmed_events=confirmed_events)
-        except OCRNotReady as exc:
-            log(f"OCR 通道不可用：{exc}", "warn")
-            log("本次跳过 OCR 识别（不影响出片；安装依赖后重启生效）", "warn")
-        else:
-            _write_csv(work_dir / "ocr_signal.csv", ocr["signals"])
-    if ocr is not None and ocr.get("player"):
-        tl["player"] = ocr["player"]
-    elif np_info.get("player"):
-        tl["player"] = np_info["player"]      # OCR 未跑/未读到：名牌名兜底
-    elif not tl.get("player"):
-        # OCR 没跑/没读到名字：骷髅头确认事件自带玩家名（读播报行所得）
-        named = [e.get("killer") for e in confirmed_events if e.get("killer")]
-        if named:
-            tl["player"] = max(set(named), key=named.count)
-    if cfg.get("review", {}).get("enabled"):
-        try:
-            review_timeline(video, tl, cfg, work_dir)
-        except ReviewNotReady as exc:
-            log(f"语义复核不可用：{exc}", "warn")
-            log("本次跳过复核，按纯信号模式出片（不影响成片）", "warn")
-    (work_dir / "timeline.json").write_text(
-        json.dumps(tl, ensure_ascii=False, indent=2), encoding="utf-8")
-    (work_dir / "captions.srt").write_text(make_srt(tl["selected"]), encoding="utf-8")
-    log(f"候选 {tl['cluster_count']} 段，入选 {tl['selected_count']} 段 "
-        f"（{tl['total_selected_sec']:.1f}s）", "timeline")
-
-    render_info = None
-    if getattr(args, "dry_run", False):
-        log("dry-run：跳过视频渲染，只输出检测与决策产物", "render")
-    else:
-        render_info = render(video, tl["selected"], out_path, work_dir, cfg, meta)
-
-    agent_info = orchestrate(tl, cfg, work_dir, render_info)
-    (work_dir / "timeline.json").write_text(
-        json.dumps(tl, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"work_dir": str(work_dir), "timeline": tl, "render": render_info,
-            "agent": agent_info, "visual_events": visual["events"], "meta": meta}
+    return {"visual_events": visual["events"], "audio_events": audio.get("events", []),
+            "signals": visual.get("signals", []), "rms": audio.get("rms", []),
+            "ocr": ocr, "model_events": model_events,
+            "exclude": exclude, "np_player": np_info.get("player", ""),
+            "np_info": np_info, "pov": pov_info}
 
 
 def _summary(res: dict) -> None:
@@ -380,6 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""示例:
   python run.py demo                          一键生成合成录像并跑通全流程
   python run.py process D:/videos/match.mp4   处理自己的录像
+  python run.py process a.mp4 b.mp4 c.mp4     多素材合并成一份集锦
   python run.py roi-preview D:/videos/match.mp4 --time 20
   python run.py process D:/videos/match.mp4 --threshold 0.4 --dry-run
   python run.py fetch-model                   下载 Crispy 预训练模型权重（一次性）
@@ -406,8 +521,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--png", help="截图输出路径")
     _add_common(p)
 
-    p = sub.add_parser("process", help="处理一段录像")
-    p.add_argument("video")
+    p = sub.add_parser("process", help="处理一段录像（可传多个同游戏素材，合并出一份集锦）")
+    p.add_argument("video", nargs="+",
+                   help="录像文件路径（1 个或多个；多个时按顺序合并成一份集锦）")
     _add_common(p)
 
     p = sub.add_parser("fetch-model",

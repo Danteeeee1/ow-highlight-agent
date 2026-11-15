@@ -478,7 +478,9 @@ def review_timeline(video: str | Path, tl: dict, cfg: dict,
         + (f"，玩家「{player}」" if player else ""), "review")
 
     def work(seg):
-        return seg, _call_vlm(video, seg, cfg, key, player=player)
+        # 多素材：段自带源文件（时间已是素材内局部时间），单素材回退全局 video
+        vid = Path(seg.get("src_video") or video)
+        return seg, _call_vlm(vid, seg, cfg, key, player=player)
 
     results: dict[int, dict] = {}
     errors: list[str] = []

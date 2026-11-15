@@ -481,13 +481,21 @@ class App:
 
     # ------------------------------------------------ 事件处理
     def _pick_video(self):
-        path = filedialog.askopenfilename(
-            title="选择录像文件",
+        paths = filedialog.askopenfilenames(
+            title="选择录像文件（可多选，多个同游戏素材将合并出一份集锦）",
             filetypes=[("视频", "*.mp4 *.mkv *.mov *.avi *.flv *.ts"),
                        ("所有文件", "*.*")])
-        if path:
-            self.var_video.set(path)
-            self._probe_video(path)
+        if paths:
+            self.var_video.set("; ".join(paths))
+            self._probe_video(paths[0])
+            if len(paths) > 1:
+                _LOGQ.put(("gui", f"[probe] 已选 {len(paths)} 条素材，"
+                                  f"将按顺序合并成一份集锦\n"))
+
+    @staticmethod
+    def _video_list(text: str) -> list[str]:
+        """输入框内容 → 视频路径列表（分号分隔，兼容单路径）。"""
+        return [p.strip().strip('"') for p in text.split(";") if p.strip()]
 
     def _probe_video(self, path: str):
         def fn():
@@ -507,7 +515,8 @@ class App:
         threading.Thread(target=fn, daemon=True).start()
 
     def _roi_preview(self):
-        video = self.var_video.get().strip()
+        paths = self._video_list(self.var_video.get())
+        video = paths[0] if paths else ""   # ROI 标定用第一条素材
         if not video:
             messagebox.showinfo("ROI 预览", "请先选择录像文件。")
             return
@@ -571,13 +580,22 @@ class App:
         self._spawn(fn, "模型权重下载完成，可切换到「Crispy 神经网络」开始处理。")
 
     def _run_process(self):
-        video = self.var_video.get().strip()
-        if not video:
+        videos = self._video_list(self.var_video.get())
+        if not videos:
             messagebox.showinfo("开始处理", "请先选择录像文件（或点「生成演示」体验流程）。")
             return
-        if not Path(video).is_file():
-            messagebox.showerror("开始处理", f"文件不存在:\n{video}")
+        missing = [v for v in videos if not Path(v).is_file()]
+        if missing:
+            messagebox.showerror("开始处理", "文件不存在:\n" + "\n".join(missing[:5]))
             return
+        if len(videos) > 1 and messagebox.askyesno(
+                "多素材合并",
+                f"已选 {len(videos)} 条素材，将合并出一份集锦。\n"
+                "建议所有素材为同游戏、同分辨率录制。继续？"):
+            pass
+        elif len(videos) > 1:
+            return
+        video_arg = videos[0] if len(videos) == 1 else videos
         if not (self.env["ffmpeg"] and self.env["ffprobe"]):
             messagebox.showerror(
                 "开始处理", "未找到 ffmpeg / ffprobe。\n请安装: winget install --id Gyan.FFmpeg -e\n"
@@ -593,23 +611,24 @@ class App:
                 self._fetch_model()
                 return
         try:
-            cfg, args = self._cfg_with_overrides(video=video,
+            cfg, args = self._cfg_with_overrides(video=video_arg,
                                                   dry_run=self.var_dry.get())
         except (ValueError, KeyError) as exc:
             messagebox.showerror("参数错误", str(exc))
             return
         self._save_apikey()  # 先把输入框里的 Key 落盘/生效，再做检测
         if cfg["review"].get("enabled"):
-            self._precheck_api_then(cfg, lambda: self._start_process(video, args, cfg))
+            self._precheck_api_then(cfg, lambda: self._start_process(video_arg, args, cfg))
             return
-        self._start_process(video, args, cfg)
+        self._start_process(video_arg, args, cfg)
 
-    def _start_process(self, video: str, args, cfg: dict):
+    def _start_process(self, video, args, cfg: dict):
+        shown = "; ".join(video) if isinstance(video, list) else str(video)
         self._set_running(True, "处理中…（关闭窗口不会安全中止，请耐心等待）")
         self.tree.delete(*self.tree.get_children())
         self.btn_open.config(state="disabled")
         self.btn_play.config(state="disabled")
-        gui_log(f"开始处理: {video}" + ("（dry-run）" if self.var_dry.get() else ""), "run")
+        gui_log(f"开始处理: {shown}" + ("（dry-run）" if self.var_dry.get() else ""), "run")
 
         def fn():
             res = process_video(video, args, cfg)

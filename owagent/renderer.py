@@ -21,8 +21,15 @@ def make_srt(selected: list[dict]) -> str:
 
 def render(video: str | Path, selected: list[dict], out_path: str | Path,
            work_dir: str | Path, cfg: dict, meta: dict) -> dict:
+    """Render the selected timeline into an MP4 with ffmpeg (plus .srt captions).
+
+    Multi-source mode: each segment may carry ``src_video`` (its own source
+    file) with LOCAL ``start``/``end`` times - the clip is cut from that file
+    instead of `video` (which stays as the single-source default).
+    """
     if not selected:
         raise ToolError("没有入选片段，无法渲染。请降低 --threshold 或看 signals.csv 调参。")
+    base_video = str(video)
     work_dir = Path(work_dir)
     parts_dir = work_dir / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -57,12 +64,14 @@ def render(video: str | Path, selected: list[dict], out_path: str | Path,
     part_files: list[Path] = []
     for i, seg in enumerate(selected, 1):
         part = parts_dir / f"part_{i:03d}.mp4"
+        # 多素材：段自带源文件与素材内局部时间；单素材回退全局 video
+        seg_video = str(seg.get("src_video") or base_video)
         dur = seg["end"] - seg["start"]
         if has_audio:
-            cmd = ["-ss", f"{seg['start']:.3f}", "-i", str(video),
+            cmd = ["-ss", f"{seg['start']:.3f}", "-i", seg_video,
                    "-map", "0:v:0", "-map", "0:a:0?"]
         else:
-            cmd = ["-ss", f"{seg['start']:.3f}", "-i", str(video),
+            cmd = ["-ss", f"{seg['start']:.3f}", "-i", seg_video,
                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                    "-map", "0:v:0", "-map", "1:a:0"]
         cmd += ["-t", f"{dur:.3f}", "-vf", vf,

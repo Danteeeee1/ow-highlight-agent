@@ -99,7 +99,13 @@ def orchestrate(tl: dict, cfg: dict, work_dir: str | Path, render_info: dict | N
     rec = cfg.get("recognizer", {})
     backend = rec.get("backend", "none")
     lines.append("# 高光剪辑决策报告\n")
-    lines.append(f"- 源视频：`{tl['source_video']}`")
+    src = tl.get("source_video")
+    if isinstance(src, list):
+        lines.append(f"- 源视频：{len(src)} 条素材（虚拟拼接共 {fmt_time(tl['duration'])}）")
+        for s in src:
+            lines.append(f"  - `{s}`")
+    else:
+        lines.append(f"- 源视频：`{src}`")
     lines.append(f"- 时长：{fmt_time(tl['duration'])}")
     if backend == "crispy":
         from .reviewer import GAME_NAMES
