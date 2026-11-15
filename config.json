@@ -62,7 +62,8 @@
   "select": {
     "top_k": 6,
     "max_total_sec": 120.0,
-    "min_score": 0.0
+    "min_score": 0.0,
+    "playerless_penalty": 0.15
   },
   "render": {
     "width": 0,

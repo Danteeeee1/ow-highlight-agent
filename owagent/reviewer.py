@@ -326,6 +326,20 @@ def _card_hint(seg: dict) -> str:
             f"落地 {total} 杀（本回合累计第 {top} 杀），kill_count 不得低于 {total}。")
 
 
+def _player_hint(player: str) -> str:
+    """Name the recorder for the VLM so commentary doesn't rename them.
+
+    The VLM half-reads player names from keyframes and invents spellings
+    ("DAnTe" -> "Jaden"). When the OCR channel has anchored the recorder's
+    actual feed name, stating it explicitly keeps the model on-script and
+    tells it which feed rows are the player's own kills.
+    """
+    if not player:
+        return ""
+    return (f"录像玩家（第一人称视角本人）是「{player}」，"
+            f"kill feed 中该名字的行就是玩家本人的击杀。")
+
+
 def _apply_ocr_override(seg: dict, review: dict, game: str) -> None:
     """OCR counted the feed rows deterministically - trust it over the VLM.
 
@@ -335,8 +349,9 @@ def _apply_ocr_override(seg: dict, review: dict, game: str) -> None:
     """
     ks = seg.get("ocr_kills") or []
     floor = max((k["streak"] for k in ks), default=0)
-    # 击杀卡牌只计玩家本人的击杀：是 kill_count 更硬的下限
+    # 击杀卡牌/骷髅头确认只计玩家本人的击杀：是 kill_count 更硬的下限
     floor = max(floor, sum(k["kills"] for k in (seg.get("card_kills") or [])))
+    floor = max(floor, int(seg.get("confirmed_kills") or 0))
     if floor < 2 or review.get("kill_count", 0) >= floor:
         return
     review["kill_count"] = floor
@@ -354,7 +369,8 @@ def _apply_ocr_override(seg: dict, review: dict, game: str) -> None:
         review["is_highlight"] = True
 
 
-def _call_vlm(video: Path, seg: dict, cfg: dict, key: str) -> dict:
+def _call_vlm(video: Path, seg: dict, cfg: dict, key: str,
+              player: str = "") -> dict:
     """One API call: N keyframes of one segment -> normalized review dict."""
     rv = cfg["review"]
     game = cfg.get("recognizer", {}).get("game", "overwatch")
@@ -368,6 +384,7 @@ def _call_vlm(video: Path, seg: dict, cfg: dict, key: str) -> dict:
         "type": "text",
         "text": (f"片段 #{seg.get('rank', seg.get('id', '?'))}，"
                  f"源片 {seg['start']:.1f}s - {seg['end']:.1f}s。"
+                 + _player_hint(player)
                  + _ocr_hint(seg)
                  + _card_hint(seg)
                  + _l1_hint(seg)
@@ -452,14 +469,16 @@ def review_timeline(video: str | Path, tl: dict, cfg: dict,
         log("没有入选片段，跳过语义复核", "review")
         return {"skipped": "no segments"}
     game = cfg.get("recognizer", {}).get("game", "overwatch")
+    player = str(tl.get("player") or "")
     max_seg = int(rv.get("max_segments", 8))
     todo = selected[:max_seg]
     log(f"语义复核（{GAME_NAMES.get(game, game)}）：{len(todo)}/{len(selected)} 段，"
         f"每段最多 {rv.get('frames_per_segment', 4)} 关键帧，"
-        f"模型 {rv.get('model', 'deepseek-flash')}（{rv.get('provider', 'deepseek')} 云端）", "review")
+        f"模型 {rv.get('model', 'deepseek-flash')}（{rv.get('provider', 'deepseek')} 云端）"
+        + (f"，玩家「{player}」" if player else ""), "review")
 
     def work(seg):
-        return seg, _call_vlm(video, seg, cfg, key)
+        return seg, _call_vlm(video, seg, cfg, key, player=player)
 
     results: dict[int, dict] = {}
     errors: list[str] = []

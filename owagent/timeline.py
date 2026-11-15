@@ -57,6 +57,13 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
         else:
             clusters.append({"events": [e], "first": e["t"], "last": e["t"]})
 
+    # 玩家中心性：击杀卡牌/骷髅头是 HUD 私有元素（只有录像主人本人能看到），
+    # 一旦确认过"玩家本人的击杀"，成片就该以玩家为主角——无玩家击杀的段
+    # （别人的连杀/纯架枪/换弹）降权。整段录像都没确认过玩家击杀时（通道
+    # 未启用/玩家零杀）不降权，避免把纯音频精彩段误杀。
+    has_player_kills = any(e.get("confirmed") for e in visual_events)
+    playerless_penalty = float(sel.get("playerless_penalty", 0.15))
+
     # 长簇按击杀波次拆分：音频峰值在射击游戏里几乎连续，会把多场战斗
     # 连成一个几十秒的大簇；按视觉/模型事件的间隙切开，一波战斗一个候选。
     wave_gap = gap + 3.0
@@ -82,6 +89,10 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
         kill_bonus = min(0.10 + 0.05 * max(confirmed_kills - 1, 0), 0.20) if confirmed_kills else 0.0
         score = (0.40 * base + 0.30 * combo + 0.20 * cross + 0.10 * margin
                  + kill_bonus)
+        # 玩家中心性降权：有玩家击杀铁证、但这段一个都没有
+        penalized = has_player_kills and not confirmed_kills and playerless_penalty > 0
+        if penalized:
+            score -= playerless_penalty
 
         # OCR 读到的具名击杀（含连杀数），供 VLM 复核提示与 L3 融合使用
         ocr_kills = [{"t": e["t"], "killer": e.get("killer", ""),
@@ -101,6 +112,8 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
         elif confirmed:
             killer = confirmed[0].get("killer") or "玩家"
             bits.append(f"骷髅头确认玩家击杀×{len(confirmed)}（{killer}）")
+        if penalized:
+            bits.append("无玩家击杀确认（降权）")
         if ocr_kills:
             names = sorted({k["killer"] for k in ocr_kills})
             lead = names[0] if len(names) == 1 else f"{names[0]} 等{len(names)}人"
@@ -127,6 +140,9 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
             "event_times": [round(e["t"], 3) for e in events],
             "kill_times": [round(e["t"], 3) for e in vis],
             "visual_count": len(vis), "audio_count": len(aud),
+            "confirmed_kills": confirmed_kills,
+            "confirmed_detail": [{"t": round(e["t"], 3), "kills": int(e.get("kills", 1))}
+                                 for e in confirmed],
             "ocr_kills": ocr_kills,
             "card_kills": card_kills,
             "peak_strength": round(base, 4),
@@ -217,6 +233,11 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
             m["event_times"] = sorted(set(m["event_times"] + item["event_times"]))
             m["visual_count"] += item["visual_count"]
             m["audio_count"] += item["audio_count"]
+            if item.get("confirmed_detail"):
+                seen = {k["t"] for k in m.get("confirmed_detail", [])}
+                m["confirmed_detail"] = m.get("confirmed_detail", []) + [
+                    k for k in item["confirmed_detail"] if k["t"] not in seen]
+                m["confirmed_detail"].sort(key=lambda k: k["t"])
             if item.get("ocr_kills"):
                 seen = {(k["t"], k["killer"], k["victim"]) for k in m.get("ocr_kills", [])}
                 m["ocr_kills"] = m.get("ocr_kills", []) + [
@@ -234,6 +255,18 @@ def build_timeline(video: str | Path, visual_events: list[dict], audio_events: l
             if m["end"] - m["start"] > max_len:
                 m["start"] = m["end"] - max_len
             m["duration"] = round(m["end"] - m["start"], 3)
+            # 截断窗口后重算：事件/确认击杀只统计最终窗口内的，否则被截掉
+            # 前段的卡牌击杀会虚增 kill_count 下限（实测合并段多算 1 杀）
+            m["event_times"] = [t for t in m["event_times"]
+                                if m["start"] <= t <= m["end"]]
+            m["kill_times"] = [t for t in m.get("kill_times", [])
+                               if m["start"] <= t <= m["end"]]
+            detail = [k for k in m.get("confirmed_detail", [])
+                      if m["start"] - 1.0 <= k["t"] <= m["end"]]
+            m["confirmed_detail"] = detail
+            m["confirmed_kills"] = sum(k["kills"] for k in detail)
+            m["card_kills"] = [k for k in (m.get("card_kills") or [])
+                               if m["start"] - 1.0 <= k["t"] <= m["end"]]
         else:
             merged.append(item)
     chosen = merged

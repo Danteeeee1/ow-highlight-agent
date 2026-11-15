@@ -160,6 +160,10 @@ def process_video(video: str | Path, args, cfg: dict,
             log(f"击杀卡牌通道合并：+{len(kc_events)} 组玩家击杀（共 {total} 杀）"
                 f"→ {len(visual['events'])} 个事件", "killcard")
 
+    # HUD 私有确认事件（骷髅头/击杀卡牌）：时刻即"录像玩家本人击杀"的铁证，
+    # 供 OCR annotate 玩家名推断与 VLM 玩家提示使用
+    confirmed_events = [e for e in visual["events"] if e.get("confirmed")]
+
     _write_csv(work_dir / "signals.csv", visual["signals"])
     _write_csv(work_dir / "audio_rms.csv", audio["rms"])
     if ocr is not None:
@@ -171,12 +175,20 @@ def process_video(video: str | Path, args, cfg: dict,
     # annotate 模式：时间轴定型后，只对入选片段读击杀播报（默认模式）
     if ocr_cfg.get("enabled") and ocr_cfg.get("mode", "annotate") == "annotate":
         try:
-            ocr = annotate_selected(video, cfg, meta, tl, model_events=model_events)
+            ocr = annotate_selected(video, cfg, meta, tl, model_events=model_events,
+                                    confirmed_events=confirmed_events)
         except OCRNotReady as exc:
             log(f"OCR 通道不可用：{exc}", "warn")
             log("本次跳过 OCR 识别（不影响出片；安装依赖后重启生效）", "warn")
         else:
             _write_csv(work_dir / "ocr_signal.csv", ocr["signals"])
+    if ocr is not None and ocr.get("player"):
+        tl["player"] = ocr["player"]
+    elif not tl.get("player"):
+        # OCR 没跑/没读到名字：骷髅头确认事件自带玩家名（读播报行所得）
+        named = [e.get("killer") for e in confirmed_events if e.get("killer")]
+        if named:
+            tl["player"] = max(set(named), key=named.count)
     if cfg.get("review", {}).get("enabled"):
         try:
             review_timeline(video, tl, cfg, work_dir)

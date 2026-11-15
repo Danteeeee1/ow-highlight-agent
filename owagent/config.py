@@ -100,7 +100,8 @@ DEFAULT_CONFIG = {
         "pre_roll": 4.0, "post_roll": 3.0, "merge_gap": 5.0,
         "min_len": 3.0, "max_len": 16.0
     },
-    "select": {"top_k": 6, "max_total_sec": 120.0, "min_score": 0.0},
+    "select": {"top_k": 6, "max_total_sec": 120.0, "min_score": 0.0,
+               "playerless_penalty": 0.15},
     "render": {
         "_comment": "width/height/fps 为 0 表示跟随源（推荐）：成片保持录像原始分辨率/帧率，"
                     "不做降采样。crf 18 接近视觉无损；烧字幕时 parts 走近无损中间档，"
@@ -154,6 +155,8 @@ def validate(cfg: dict, meta: dict | None = None) -> None:
         raise ValueError("pre_roll / post_roll 不能为负")
     if cfg["select"]["top_k"] < 1:
         raise ValueError("select.top_k 至少为 1")
+    if not 0.0 <= float(cfg["select"].get("playerless_penalty", 0.15)) <= 0.5:
+        raise ValueError("select.playerless_penalty 建议在 0~0.3 之间（0=关闭玩家中心性降权）")
     rec = cfg["recognizer"]
     if rec["backend"] not in ("none", "crispy"):
         raise ValueError(f"recognizer.backend 只能是 none / crispy，当前为 {rec['backend']}")

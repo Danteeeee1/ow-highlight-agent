@@ -184,17 +184,54 @@ def _canon_killers(kills: list[dict], threshold: float = 0.8) -> None:
 
 
 def _infer_player(kills: list[dict], model_events: list[dict],
+                  confirmed_events: list[dict] | None = None,
                   window: float = 2.5) -> str:
-    """The recorder's kills are the ones the Crispy medal channel confirms."""
+    """The recorder's kills are the ones the player-private HUD confirms.
+
+    Two kinds of anchors, both only visible to the recorder:
+      * model_events - Crispy medal frames (cash-award icon rows in the feed)
+      * confirmed_events - killcard (CS2 bottom card stack) / skull (OW center
+        confirm) hits; a mid-match rename makes the feed name drift, but the
+        anchor TIMES stay correct, so they vote by proximity rather than name.
+    """
     if not kills:
+        return ""
+    anchors = [float(e["t"]) for e in (model_events or [])]
+    anchors += [float(e["t"]) for e in (confirmed_events or []) if e.get("confirmed")]
+    if not anchors:
         return ""
     counts: dict[str, int] = {}
     for k in kills:
-        if any(abs(k["t"] - m["t"]) <= window for m in model_events):
+        if any(abs(k["t"] - a) <= window for a in anchors):
             counts[k["killer_key"]] = counts.get(k["killer_key"], 0) + 1
     if counts:
         return max(counts, key=counts.get)
     return ""
+
+
+def _match_player_key(kills: list[dict], player: str) -> str:
+    """Map a config-typed player name onto the OCR killer_key cluster."""
+    if not player or not kills:
+        return player
+    keys = {k["killer_key"] for k in kills}
+    for kk in keys:
+        if _similar(_norm_name(kk), _norm_name(player)) >= 0.8:
+            return kk
+    best = max(keys, key=lambda kk: _similar(_norm_name(kk), _norm_name(player)))
+    if _similar(_norm_name(best), _norm_name(player)) >= 0.6:
+        return best
+    return player
+
+
+def _canonical_display(kills: list[dict], player_key: str) -> str:
+    """Most frequent spelling inside the player's cluster = canonical name."""
+    variants = [k["killer"] for k in kills if k["killer_key"] == player_key]
+    if not variants:
+        return player_key
+    counts: dict[str, int] = {}
+    for v in variants:
+        counts[v] = counts.get(v, 0) + 1
+    return max(counts, key=counts.get)
 
 
 def _gate_windows(gate_events: list[dict], duration: float) -> list[tuple[float, float]]:
@@ -217,11 +254,14 @@ def _in_windows(t: float, windows: list[tuple[float, float]]) -> bool:
 def detect_ocr(video: str | Path, cfg: dict, meta: dict,
                model_events: list[dict] | None = None,
                gate_events: list[dict] | None = None,
-               windows: list[tuple[float, float]] | None = None) -> dict:
+               windows: list[tuple[float, float]] | None = None,
+               confirmed_events: list[dict] | None = None) -> dict:
     """Read the kill feed inside `windows` (or gate events / whole video).
 
     Returns {"events", "kills", "player", ...}; every kill event carries
     killer / victim / streak, deterministic data the other channels lack.
+    `confirmed_events` are killcard/skull hits (HUD only the recorder can
+    see) - they anchor player-name inference more reliably than medals.
     """
     oc = cfg.get("ocr", {})
     game = cfg.get("recognizer", {}).get("game", "overwatch")
@@ -325,8 +365,19 @@ def detect_ocr(video: str | Path, cfg: dict, meta: dict,
             log(f"OCR 解码失败: {detail}", "warn")
 
     _canon_killers(kills)
+    player_key = ""
     if not player:
-        player = _infer_player(kills, model_events or [])
+        player = _infer_player(kills, model_events or [], confirmed_events or [])
+    if player:
+        # 把玩家名映射到 OCR 簇（配置手输的名字可能和 OCR 读法有出入），
+        # 再统一簇内拼写：DAnTe/JILaOSh1s 这类换字错读都归一到最高频写法
+        player_key = _match_player_key(kills, player)
+        canon = _canonical_display(kills, player_key)
+        if canon and canon != player:
+            player = canon
+        for k in kills:
+            if k["killer_key"] == player_key and k["killer"] != canon:
+                k["killer"] = canon
 
     # streak: same killer_key within streak_window before (and including) this kill
     events: list[dict] = []
@@ -335,7 +386,7 @@ def detect_ocr(video: str | Path, cfg: dict, meta: dict,
                          if kills[j]["killer_key"] == k["killer_key"]
                          and k["t"] - kills[j]["t"] <= streak_window)
         k["streak"] = streak
-        own = (not player) or k["killer_key"] == player
+        own = (not player) or k["killer_key"] == player_key
         events.append({
             "t": k["t"], "source": "ocr",
             "strength": round(0.55 + 0.35 * own + 0.05 * min(streak, 3), 3),
@@ -353,7 +404,8 @@ def detect_ocr(video: str | Path, cfg: dict, meta: dict,
 
 
 def annotate_selected(video: str | Path, cfg: dict, meta: dict, tl: dict,
-                      model_events: list[dict] | None = None) -> dict:
+                      model_events: list[dict] | None = None,
+                      confirmed_events: list[dict] | None = None) -> dict:
     """Annotate mode: OCR only the SELECTED segments of a built timeline.
 
     Multi-kill judgement only matters inside candidate clips, and recall is
@@ -365,14 +417,29 @@ def annotate_selected(video: str | Path, cfg: dict, meta: dict, tl: dict,
     if not segs:
         return {"events": [], "kills": [], "player": "", "segments": 0}
     windows = [(float(s["start"]), float(s["end"])) for s in segs]
-    res = detect_ocr(video, cfg, meta, model_events=model_events, windows=windows)
+    res = detect_ocr(video, cfg, meta, model_events=model_events, windows=windows,
+                     confirmed_events=confirmed_events)
 
     kills = res["kills"]
     player = res["player"]
+    tl["player"] = player
     for seg in segs:
         lo, hi = float(seg["start"]) - 1.0, float(seg["end"])
         ks = [{"t": k["t"], "killer": k["killer"], "victim": k["victim"],
                "streak": k["streak"]} for k in kills if lo <= k["t"] <= hi]
+        # 骷髅头/卡牌确认事件在 _emit 时已写入候选段的 ocr_kills（带 killer 名），
+        # 与本次 OCR 读到的行按时间+击杀者模糊合并去重，两条通道的证据都保留
+        prior = seg.get("ocr_kills") or []
+        if prior:
+            merged_rows = list(prior)
+            for k in ks:
+                if not any(abs(k["t"] - p["t"]) <= 1.5
+                           and (_similar(_norm_name(k["killer"]), _norm_name(p["killer"])) >= 0.6
+                                or _similar(_norm_name(k["victim"]), _norm_name(p["victim"])) >= 0.6)
+                           for p in merged_rows):
+                    merged_rows.append(k)
+            merged_rows.sort(key=lambda k: k["t"])
+            ks = merged_rows
         seg["ocr_kills"] = ks
         max_streak = max((k["streak"] for k in ks), default=0)
         if ks:
